@@ -32,6 +32,7 @@ import { getLog } from '../boundary/log.ts'
 import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
 import { nthAssistantResponse } from '../logic/copy.ts'
+import { envFlag } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
 import { createPasteStore } from '../logic/pastes.ts'
 import { mapResumeHistory, mapSessionList } from '../logic/resume.ts'
@@ -461,16 +462,14 @@ function streamHello(controller: FakeGatewayController): void {
   controller.emit({ type: 'message.complete' })
 }
 
-const TRUE_RE = /^(?:1|true|yes|on)$/i
-
 if (import.meta.main) {
-  const fake = TRUE_RE.test(process.env.HERMES_TUI_FAKE?.trim() ?? '')
+  const fake = envFlag(process.env.HERMES_TUI_FAKE, false)
   const cols = process.stdout.columns || 80
   const initialPrompt = process.env.HERMES_TUI_PROMPT?.trim() || process.argv.slice(2).join(' ').trim()
   const resumeId = process.env.HERMES_TUI_RESUME?.trim()
   // Mouse on by default (opencode parity: wheel-scroll the transcript, drag the
   // scrollbar, click-to-expand tools, text-aware selection). HERMES_TUI_MOUSE=0 opts out.
-  const mouse = !/^(?:0|false|no|off)$/i.test(process.env.HERMES_TUI_MOUSE?.trim() ?? '')
+  const mouse = envFlag(process.env.HERMES_TUI_MOUSE, true)
   const base = { mouse, fake, cols }
   const withPrompt = initialPrompt ? { ...base, initialPrompt } : base
   const input: TuiInput = resumeId ? { ...withPrompt, resumeId } : withPrompt

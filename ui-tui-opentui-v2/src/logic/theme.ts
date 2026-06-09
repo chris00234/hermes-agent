@@ -14,6 +14,8 @@
  * ui-tui/src/gatewayTypes.ts). Keep this port in sync if that contract changes.
  */
 
+import { FALSE_RE, TRUE_RE } from './env.ts'
+
 export interface ThemeColors {
   primary: string
   accent: string
@@ -316,9 +318,6 @@ export const LIGHT_THEME: Theme = {
   bannerLogo: '',
   bannerHero: ''
 }
-
-const TRUE_RE = /^(?:1|true|yes|on)$/
-const FALSE_RE = /^(?:0|false|no|off)$/
 
 const LIGHT_DEFAULT_TERM_PROGRAMS = new Set<string>(['Apple_Terminal'])
 
