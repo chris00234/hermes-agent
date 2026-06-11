@@ -29,6 +29,15 @@ import os
 import shutil
 import subprocess
 import sys
+
+# Allow importing from the repo root when run as a script
+import sys
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from hermes_cli.managed_uv import get_pip_cmd
 from pathlib import Path
 
 # Ensure sibling modules (_hermes_home) are importable when run standalone.
@@ -108,7 +117,7 @@ def install_deps():
     # First choice: pip in the current interpreter. Works for most installs.
     try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + REQUIRED_PACKAGES,
+            get_pip_cmd() + ["install", "--quiet"] + REQUIRED_PACKAGES,
             stdout=subprocess.DEVNULL,
         )
         print("Dependencies installed.")
