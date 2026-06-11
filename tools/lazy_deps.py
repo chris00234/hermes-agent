@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.managed_uv import get_pip_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -349,26 +350,6 @@ def _is_present(spec: str) -> bool:
         return False
 
 
-def _get_pip_cmd() -> list[str]:
-    """Return the preferred pip command prefix.
-    
-    Hermes manages its own uv binary at `$HERMES_HOME/bin/uv`. This returns
-    the managed uv pip command prefix, falling back to `python -m pip` only
-    in degenerate cases where the managed binary is missing.
-    """
-    home = get_hermes_home()
-    if platform.system() == "Windows":
-        uv_bin = home / "bin" / "uv.exe"
-    else:
-        uv_bin = home / "bin" / "uv"
-    
-    if uv_bin.is_file() and os.access(uv_bin, os.X_OK):
-        return [str(uv_bin), "pip"]
-    
-    # Degenerate fallback
-    return [sys.executable, "-m", "pip"]
-
-
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` into the active venv using the managed uv binary.
 
@@ -380,7 +361,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
-    pip_cmd = _get_pip_cmd()
+    pip_cmd = get_pip_cmd()
 
     try:
         r = subprocess.run(

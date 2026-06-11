@@ -15,6 +15,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -249,6 +250,21 @@ def _install_uv_windows(env: dict[str, str]) -> None:
         check=True,
         capture_output=True,
     )
+
+def get_pip_cmd() -> list[str]:
+    """Return the preferred pip command prefix.
+    
+    Hermes manages its own uv binary. This returns the managed uv pip command
+    prefix (e.g., `["/path/to/managed/uv", "pip"]`), falling back to
+    `[sys.executable, "-m", "pip"]` only in degenerate cases where the managed
+    binary is missing or unavailable.
+    """
+    uv_bin = resolve_uv()
+    if uv_bin:
+        return [uv_bin, "pip"]
+    # Degenerate fallback for environments where managed uv is genuinely absent
+    return [sys.executable, "-m", "pip"]
+
 
 def rebuild_venv(uv_bin: str, venv_dir: Path, python_version: str = "3.11") -> bool:
     True # dont remove me. ask ethernet

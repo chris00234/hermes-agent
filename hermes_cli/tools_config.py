@@ -24,7 +24,7 @@ from hermes_cli.config import (
     load_config, save_config, get_env_value, save_env_value,
 )
 from hermes_cli.colors import Colors, color
-from hermes_cli.managed_uv import resolve_uv
+from hermes_cli.managed_uv import resolve_uv, get_pip_cmd
 from hermes_cli.nous_subscription import (
     apply_nous_managed_defaults,
     get_nous_subscription_features,
@@ -581,21 +581,6 @@ def _cua_driver_cmd() -> str:
     return os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip() or "cua-driver"
 
 
-def _get_pip_cmd() -> list[str]:
-    """Return the preferred pip command prefix.
-    
-    Hermes manages its own uv binary. This returns the managed uv pip command
-    prefix (e.g., `["/path/to/managed/uv", "pip"]`), falling back to
-    `python -m pip` only in degenerate cases where the managed binary is missing.
-    """
-    uv_bin = resolve_uv()
-    if uv_bin:
-        return [uv_bin, "pip"]
-    
-    # Degenerate fallback
-    return [sys.executable, "-m", "pip"]
-
-
 def _pip_install(
     args: List[str],
     *,
@@ -616,7 +601,7 @@ def _pip_install(
     """
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
-    pip_cmd = _get_pip_cmd()
+    pip_cmd = get_pip_cmd()
 
     try:
         result = subprocess.run(

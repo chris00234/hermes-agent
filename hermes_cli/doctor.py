@@ -12,6 +12,7 @@ from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.managed_uv import resolve_uv
 from hermes_constants import display_hermes_home
 
 PROJECT_ROOT = get_project_root()
@@ -577,6 +578,13 @@ def run_doctor(args):
     # (a git conflict resolution can silently revert one but not the other).
     _check_version_consistency(issues)
     
+    _section("Dependency Management")
+    uv_bin = resolve_uv()
+    if uv_bin:
+        check_ok(f"Managed uv available ({uv_bin})")
+    else:
+        check_warn("Managed uv not found", "(dependency installation will fall back to plain pip)")
+
     _section("Required Packages")
     required_packages = [
         ("openai", "OpenAI SDK"),
