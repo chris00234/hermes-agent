@@ -1320,7 +1320,7 @@ def run_doctor(args):
     if _safe_which("git"):
         check_ok("git")
     else:
-        check_warn("git not found", "(optional)")
+        check_warn("git not found", "(hermes update cannot work)")
     
     # ripgrep (optional, for faster file search)
     if _safe_which("rg"):
