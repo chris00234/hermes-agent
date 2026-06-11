@@ -255,4 +255,5 @@ def test_resolve_modal_image_uses_snapshot_ids_and_registry_images(tmp_path):
     assert registry_image == {"kind": "registry", "image": "python:3.11"}
     assert state["from_id_calls"] == ["im-snapshot123"]
     assert state["registry_calls"][0][0] == "python:3.11"
-    assert "ensurepip" in state["registry_calls"][0][1][0]
+    # ensurepip was removed; Hermes guarantees a managed uv binary.
+    assert "ensurepip" not in str(state["registry_calls"][0][1])

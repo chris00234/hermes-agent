@@ -224,14 +224,14 @@ class TestModalEnvironmentDefaults:
 
 
 # =========================================================================
-# Test 7: ensurepip fix in ModalEnvironment
+# Test 7: Modal image builder no longer uses ensurepip
 # =========================================================================
 
-class TestEnsurepipFix:
-    """Verify the pip fix is applied in the ModalEnvironment init."""
+class TestModalImageBuilder:
+    """Verify the Modal image builder uses clean setup without ensurepip."""
 
-    def test_modal_environment_creates_image_with_setup_commands(self):
-        """_resolve_modal_image should create a modal.Image with pip fix."""
+    def test_modal_environment_image_setup_no_ensurepip(self):
+        """_resolve_modal_image should NOT use ensurepip."""
         try:
             from tools.environments.modal import _resolve_modal_image
         except ImportError:
@@ -239,13 +239,12 @@ class TestEnsurepipFix:
 
         import inspect
         source = inspect.getsource(_resolve_modal_image)
-        assert "ensurepip" in source, (
-            "_resolve_modal_image should include ensurepip fix "
-            "for Modal's legacy image builder"
+        assert "ensurepip" not in source, (
+            "_resolve_modal_image should no longer use ensurepip; "
+            "Hermes guarantees a managed uv binary."
         )
-        assert "setup_dockerfile_commands" in source, (
-            "_resolve_modal_image should use setup_dockerfile_commands "
-            "to fix pip before Modal's bootstrap"
+        assert "apt-get install" in source or "setup_dockerfile_commands" in source, (
+            "_resolve_modal_image should use setup_dockerfile_commands for python install."
         )
 
     def test_modal_environment_uses_native_sdk(self):

@@ -2398,15 +2398,11 @@ function Install-PlatformSdks {
     # 1. The tiered `uv pip install` cascade above can fall through to a
     #    lower tier when the first fails (common when RL git deps choke),
     #    which silently skips some messaging SDKs from [messaging].
-    # 2. `uv` creates the venv without pip.  If a messaging SDK ends up
-    #    missing, the user can't `pip install python-telegram-bot` to
-    #    recover -- pip simply isn't in their venv.
+    # 2. Missing SDKs should be installed via the managed `uv` binary, which
+    #    handles dependency resolution cleanly without needing pip in the venv.
     #
-    # Strategy: bootstrap pip via `python -m ensurepip` (idempotent), then
-    # for each token set in .env, verify the matching SDK imports.  If not,
-    # run one targeted `pip install` as last-chance recovery.  Keeps fresh
-    # Windows installs from hitting silent "python-telegram-bot not installed"
-    # at runtime.
+    # Strategy: for each token set in .env, verify the matching SDK imports.
+    # If not, run one targeted `uv pip install` as last-chance recovery.
     if ($NoVenv) {
         Write-Info "Skipping platform-SDK verification (-NoVenv: no venv to bootstrap)"
         return
@@ -2470,29 +2466,18 @@ function Install-PlatformSdks {
     }
     if ($missing.Count -eq 0) { return }
 
-    # Bootstrap pip into the venv if it isn't there.  `uv` creates venvs
-    # without pip; ensurepip is the stdlib-blessed way to add it.
+    # Use the managed uv binary to install the missing SDKs.
+    # We do not need to bootstrap pip into the venv; uv handles this directly.
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "SilentlyContinue"
     try {
-        & $pythonExe -m pip --version 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Info "Bootstrapping pip into venv (uv doesn't ship pip)..."
-            & $pythonExe -m ensurepip --upgrade 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warn "ensurepip failed -- can't auto-install missing SDKs."
-                Write-Info "Manual recovery: $UvCmd pip install `"$($missing[0].Spec)`""
-                return
-            }
-        }
-
         foreach ($sdk in $missing) {
-            Write-Info "  Installing $($sdk.Spec) ..."
-            & $pythonExe -m pip install $sdk.Spec 2>&1 | ForEach-Object { Write-Host "    $_" }
+            Write-Info "  Installing $($sdk.Spec) via uv pip..."
+            & $UvCmd pip install $sdk.Spec 2>&1 | ForEach-Object { Write-Host "    $_" }
             if ($LASTEXITCODE -eq 0) {
                 Write-Success "  Installed $($sdk.Import)"
             } else {
-                Write-Warn "  Failed to install $($sdk.Spec). Recover manually: $pythonExe -m pip install `"$($sdk.Spec)`""
+                Write-Warn "  Failed to install $($sdk.Spec). Recover manually: $UvCmd pip install `"$($sdk.Spec)`""
             }
         }
     } finally {

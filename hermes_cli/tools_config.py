@@ -24,6 +24,7 @@ from hermes_cli.config import (
     load_config, save_config, get_env_value, save_env_value,
 )
 from hermes_cli.colors import Colors, color
+from hermes_cli.managed_uv import resolve_uv
 from hermes_cli.nous_subscription import (
     apply_nous_managed_defaults,
     get_nous_subscription_features,
@@ -580,6 +581,21 @@ def _cua_driver_cmd() -> str:
     return os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip() or "cua-driver"
 
 
+def _get_pip_cmd() -> list[str]:
+    """Return the preferred pip command prefix.
+    
+    Hermes manages its own uv binary. This returns the managed uv pip command
+    prefix (e.g., `["/path/to/managed/uv", "pip"]`), falling back to
+    `python -m pip` only in degenerate cases where the managed binary is missing.
+    """
+    uv_bin = resolve_uv()
+    if uv_bin:
+        return [uv_bin, "pip"]
+    
+    # Degenerate fallback
+    return [sys.executable, "-m", "pip"]
+
+
 def _pip_install(
     args: List[str],
     *,
@@ -588,64 +604,35 @@ def _pip_install(
 ):
     """Install Python packages from a post-setup hook.
 
-    Strategy (in order):
-    1. ``uv pip install`` if uv is on PATH — fast, doesn't need pip in the venv.
-    2. ``python -m pip install`` — works on stdlib venvs.
-    3. ``python -m ensurepip --upgrade`` then retry pip — covers ``uv venv``
-       which creates a venv WITHOUT pip.
-
-    Why this exists: the Windows installer creates the venv via ``uv venv``,
-    which doesn't seed pip. Post-setup hooks that shelled out to
-    ``[sys.executable, '-m', 'pip', 'install', ...]`` failed with
-    ``No module named pip`` on every fresh install. uv-first sidesteps that.
+    Strategy:
+    1. Managed ``uv pip install`` (preferred — fast, doesn't need pip in venv).
+    2. ``python -m pip install`` (degenerate fallback only).
+    
+    Legacy ``ensurepip`` bootstrapping has been removed; Hermes guarantees a
+    managed ``uv`` binary in all supported environments during post-setup hooks.
 
     Returns the ``subprocess.CompletedProcess`` from whichever tier succeeded
     (or the last failure for the caller to inspect).
     """
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
+    pip_cmd = _get_pip_cmd()
 
-    uv_bin = shutil.which("uv")
-    if uv_bin:
-        try:
-            result = subprocess.run(
-                [uv_bin, "pip", "install", *args],
-                capture_output=capture_output, text=True, timeout=timeout,
-                env=uv_env,
-            )
-            if result.returncode == 0:
-                return result
-            # Fall through to pip — uv may have failed for an unrelated reason
-            # (resolution conflict, network), and pip might handle it.
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
-    pip_cmd = [sys.executable, "-m", "pip"]
     try:
-        # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
-        probe = subprocess.run(
-            pip_cmd + ["--version"],
-            capture_output=True, text=True, timeout=15,
+        result = subprocess.run(
+            pip_cmd + ["install", *args],
+            capture_output=capture_output, text=True, timeout=timeout,
+            env=uv_env,
         )
-        if probe.returncode != 0:
-            raise FileNotFoundError("pip not in venv")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                capture_output=True, text=True, timeout=120, check=True,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            # Synthesize a result so callers see a clean failure path.
-            return subprocess.CompletedProcess(
-                pip_cmd, returncode=1, stdout="",
-                stderr=f"pip not available and ensurepip failed: {e}",
-            )
-
-    return subprocess.run(
-        pip_cmd + ["install", *args],
-        capture_output=capture_output, text=True, timeout=timeout,
-    )
+        return result
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        # Synthesize a result so callers see a clean failure path.
+        return subprocess.CompletedProcess(
+            args=pip_cmd + ["install", *args],
+            returncode=1,
+            stdout="",
+            stderr=str(e),
+        )
 
 
 

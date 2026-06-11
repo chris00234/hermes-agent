@@ -5797,22 +5797,21 @@ def _update_via_zip(args):
     else:
         # Use sys.executable to explicitly call the venv's pip module,
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
-        # Some environments lose pip inside the venv; bootstrap it back with
-        # ensurepip before trying the editable install.
-        try:
-            subprocess.run(
-                pip_cmd + ["--version"],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
+        # Hermes guarantees a managed uv binary via ensure_uv().
+        from hermes_cli.managed_uv import ensure_uv
+        uv_bin = ensure_uv()
+        if uv_bin:
+            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            if _is_termux_env(uv_env):
+                uv_env.pop("PYTHONPATH", None)
+                uv_env.pop("PYTHONHOME", None)
+            _install_python_dependencies_with_optional_fallback(
+                [uv_bin, "pip"], env=uv_env, group="termux-all" if _is_termux_env(uv_env) else "all"
             )
-        except subprocess.CalledProcessError:
-            subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                cwd=PROJECT_ROOT,
-                check=True,
+        else:
+            _install_python_dependencies_with_optional_fallback(
+                [sys.executable, "-m", "pip"], group="termux-all" if _is_termux_env() else "all"
             )
-        _install_python_dependencies_with_optional_fallback(pip_cmd)
 
     _update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
@@ -6429,10 +6428,9 @@ def _recover_from_interrupted_install() -> None:
 
     Triggered on launch when ``.update-incomplete`` is present — meaning the
     code was pulled but the dep install was killed before it verified clean.
-    Unconditionally bootstraps pip via ``ensurepip`` (a killed ``pip install``
-    can wipe pip from the venv entirely, which blocks the venv from recovering
-    on its own), then re-runs the editable ``.[all]`` install + core-dependency
-    verification, then clears the marker.
+    Re-runs the editable ``.[all]`` install via the managed ``uv`` binary
+    (guaranteed by ``ensure_uv()``), falls back to plain pip if degraded,
+    runs core-dependency verification, then clears the marker.
 
     Never raises: a recovery failure must not block launch.  If it can't
     self-heal it prints the one-line manual command and leaves the marker so
@@ -6500,18 +6498,8 @@ def _recover_from_interrupted_install() -> None:
         try:
             from hermes_cli.managed_uv import ensure_uv
 
-            # Always bootstrap pip first: a killed install can leave the venv with
-            # no pip module at all, and uv may also be gone. ensurepip restores a
-            # known-good pip so at least the plain-pip path below can proceed.
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                )
-            except Exception as exc:
-                logger.debug("ensurepip during install recovery failed: %s", exc)
-
+            # ensure_uv() guarantees the managed uv binary is present, bootstrapping
+            # it via the official installer if a killed install removed it.
             uv_bin = ensure_uv()
             if uv_bin:
                 uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
@@ -6524,6 +6512,7 @@ def _recover_from_interrupted_install() -> None:
                     group="termux-all" if _is_termux_env(uv_env) else "all",
                 )
             else:
+                # Degenerate fallback: managed uv failed to install.
                 _install_python_dependencies_with_optional_fallback(
                     [sys.executable, "-m", "pip"],
                     group="termux-all" if _is_termux_env() else "all",
@@ -6538,7 +6527,6 @@ def _recover_from_interrupted_install() -> None:
             print("✗ Could not auto-recover the interrupted install.")
             print("  Recover manually with:")
             print(f"    cd {PROJECT_ROOT}")
-            print(f"    {sys.executable} -m ensurepip --upgrade")
             print(f"    {sys.executable} -m pip install -e '.[all]'")
     finally:
         sys.stdout = saved_sys_stdout
@@ -8521,29 +8509,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             # Use sys.executable to explicitly call the venv's pip module,
             # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
-            # Some environments lose pip inside the venv; bootstrap it back with
-            # ensurepip before trying the editable install.
-            pip_cmd = [sys.executable, "-m", "pip"]
-            try:
-                subprocess.run(
-                    pip_cmd + ["--version"],
-                    cwd=PROJECT_ROOT,
-                    check=True,
-                    capture_output=True,
+            # Hermes guarantees a managed uv binary via ensure_uv().
+            from hermes_cli.managed_uv import ensure_uv
+            uv_bin = ensure_uv()
+            if uv_bin:
+                uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+                if _is_termux_env(uv_env):
+                    install_group = "termux-all"
+                    print("  → Termux detected: using curated termux-all optional profile...")
+                    uv_env.pop("PYTHONPATH", None)
+                    uv_env.pop("PYTHONHOME", None)
+                if _is_termux_env() and _is_android_python():
+                    print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
+                    _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
+                _install_python_dependencies_with_optional_fallback(
+                    [uv_bin, "pip"], env=uv_env, group=install_group
                 )
-            except subprocess.CalledProcessError:
-                subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    cwd=PROJECT_ROOT,
-                    check=True,
-                )
-            if _is_termux_env():
-                install_group = "termux-all"
-                print("  → Termux detected: using curated termux-all optional profile...")
-            if _is_termux_env() and _is_android_python():
-                print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                _install_psutil_android_compat(pip_cmd)
-            _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
+            else:
+                # Degenerate fallback: managed uv failed to install.
+                pip_cmd = [sys.executable, "-m", "pip"]
+                if _is_termux_env():
+                    install_group = "termux-all"
+                    print("  → Termux detected: using curated termux-all optional profile...")
+                if _is_termux_env() and _is_android_python():
+                    print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
+                    _install_psutil_android_compat(pip_cmd)
+                _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
 
         # Core Python deps installed AND verified (the fallback helper runs
         # _verify_core_dependencies_installed). Clear the interrupted-install

@@ -132,6 +132,13 @@ conservative at the waist.
   without E2E proof, and plugins that touch core files.** Plugins live in their
   own directory and work within the ABCs/hooks we provide; if a plugin needs
   more, widen the generic plugin surface, don't special-case it in core.
+- **Dependency installation via uv helpers, not raw pip.** Hermes manages its
+  own uv binary at `$HERMES_HOME/bin/uv`. Always use `ensure_uv()` or
+  `resolve_uv()` from `hermes_cli.managed_uv`, or a dedicated helper like
+  `_get_pip_cmd()` that returns `[uv_path, "pip"]`. **Do not** write
+  `[sys.executable, "-m", "pip"]` or `[sys.executable, "-m", "ensurepip"]`
+  directly in subprocess calls. The helpers guarantee the managed uv path and
+  only fall back to raw pip in explicitly documented degenerate edge cases.
 
 ### Before you call it a bug — verify the premise (and when NOT to close)
 

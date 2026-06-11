@@ -109,12 +109,9 @@ def _resolve_modal_image(image_spec: Any) -> Any:
     lower = image_spec.lower()
     add_python = any(base in lower for base in ("ubuntu", "debian"))
 
-    setup_commands = [
-        "RUN rm -rf /usr/local/lib/python*/site-packages/pip* 2>/dev/null; "
-        "python -m ensurepip --upgrade --default-pip 2>/dev/null || true",
-    ]
+    setup_commands = []
     if add_python:
-        setup_commands.insert(0,
+        setup_commands.append(
             "RUN apt-get update -qq && apt-get install -y -qq python3 python3-venv > /dev/null 2>&1 || true"
         )
 

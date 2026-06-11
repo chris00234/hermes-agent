@@ -70,20 +70,21 @@ def test_recovery_runs_install_and_clears_marker(tmp_path, monkeypatch):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     m._write_update_incomplete_marker()
 
-    seen = {"ensurepip": False, "install": False}
+    seen = {"uv_used": False, "install": False}
+
+    def fake_ensure_uv():
+        return "/fake/uv"
 
     def fake_run(cmd, *a, **k):
-        if "ensurepip" in cmd:
-            seen["ensurepip"] = True
-
+        if "uv" in cmd:
+            seen["uv_used"] = True
         class R:
             returncode = 0
-
         return R()
 
     monkeypatch.setattr(m.subprocess, "run", fake_run)
     monkeypatch.setattr(m, "_is_termux_env", lambda *a, **k: False)
-    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda: None)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", fake_ensure_uv)
     monkeypatch.setattr(
         m,
         "_install_python_dependencies_with_optional_fallback",
@@ -92,7 +93,6 @@ def test_recovery_runs_install_and_clears_marker(tmp_path, monkeypatch):
 
     m._recover_from_interrupted_install()
 
-    assert seen["ensurepip"] is True, "ensurepip must run unconditionally first"
     assert seen["install"] is True, "dep install must run"
     assert not m._update_marker_path().exists(), "marker cleared on success"
 
