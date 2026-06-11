@@ -42,21 +42,15 @@ from hermes_cli.psutil_android import (
     PsutilAndroidInstallError,
     prepare_patched_psutil_sdist,
 )
-
+from hermes_cli.managed_uv import get_pip_cmd
 
 
 def _resolve_install_cmd(pip_arg: str | None, prefer_uv: bool) -> list[str]:
     if pip_arg:
         return pip_arg.split()
-    if prefer_uv:
-        uv = shutil.which("uv")
-        if not uv:
-            sys.exit("--uv requested but no uv on PATH")
-        return [uv, "pip"]
-    auto_uv = shutil.which("uv")
-    if auto_uv:
-        return [auto_uv, "pip"]
-    return [sys.executable, "-m", "pip"]
+    
+    # Hermes guarantees a managed uv binary; use the centralized helper.
+    return get_pip_cmd()
 
 
 def main() -> int:

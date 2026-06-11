@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli.managed_uv import get_pip_cmd
 from hermes_constants import get_hermes_home
 
 from plugins.google_meet import process_manager as pm
@@ -251,7 +253,7 @@ def _cmd_install(*, realtime: bool, assume_yes: bool) -> int:
     print(f"\n[1/3] pip install: {' '.join(pip_pkgs)}")
     try:
         res = _sp.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", *pip_pkgs],
+            get_pip_cmd() + ["install", "--upgrade", *pip_pkgs],
             check=False,
         )
         if res.returncode != 0:

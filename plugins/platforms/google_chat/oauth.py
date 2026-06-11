@@ -68,7 +68,8 @@ import sys
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-# Pin the legacy logger name so operator-side log filters keep matching
+from hermes_cli.managed_uv import get_pip_cmd
+from utils import atomic_replace
 # after the in-tree → plugin migration. See adapter.py for context.
 logger = logging.getLogger("gateway.platforms.google_chat_user_oauth")
 
@@ -380,7 +381,7 @@ def install_deps() -> bool:
     print("Installing Google Chat OAuth dependencies...")
     try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + _REQUIRED_PACKAGES,
+            get_pip_cmd() + ["install", "--quiet"] + _REQUIRED_PACKAGES,
             stdout=subprocess.DEVNULL,
         )
         print("Dependencies installed.")

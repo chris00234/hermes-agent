@@ -8,10 +8,13 @@ the provider's config schema. Writes config to config.yaml + .env.
 from __future__ import annotations
 
 import os
-import sys
 import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
+from hermes_cli.managed_uv import get_pip_cmd
 from hermes_constants import get_hermes_home
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -96,22 +99,9 @@ def _install_dependencies(provider_name: str) -> None:
 
     print(f"\n  Installing dependencies: {', '.join(missing)}")
 
-    import shutil
-
-    uv_path = shutil.which("uv")
-    if uv_path:
-        install_cmd = [uv_path, "pip", "install", "--python", sys.executable, "--quiet"] + missing
-        manual_cmd = f"uv pip install --python {sys.executable} {' '.join(missing)}"
-    else:
-        pip_cmd = shutil.which("pip3") or shutil.which("pip")
-        if not pip_cmd:
-            print(f"  ⚠ uv not found — cannot install dependencies")
-            print(f"  Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh")
-            print(f"  Then re-run: hermes memory setup")
-            return
-        print(f"  ⚠ uv not found. Falling back to standard pip...")
-        install_cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + missing
-        manual_cmd = f"{sys.executable} -m pip install {' '.join(missing)}"
+    # Use the centralized helper for consistent uv-first installation
+    install_cmd = get_pip_cmd() + ["install", "--quiet"] + missing
+    manual_cmd = f"{' '.join(get_pip_cmd())} install {' '.join(missing)}"
 
     try:
         subprocess.run(

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
+from hermes_cli.managed_uv import get_pip_cmd
 from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import _host_block, profile_host_key, resolve_active_host, resolve_config_path, HOST
 from hermes_cli.config import cfg_get
@@ -410,10 +412,9 @@ def _ensure_sdk_installed() -> bool:
         print("  Skipping install. Run: pip install 'honcho-ai>=2.0.1'\n")
         return False
 
-    import subprocess
     print("  Installing honcho-ai...", flush=True)
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "honcho-ai>=2.0.1"],
+        get_pip_cmd() + ["install", "honcho-ai>=2.0.1"],
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
