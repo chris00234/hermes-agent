@@ -493,6 +493,17 @@ def run_doctor(args):
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
+    print()
+
+    # Check for explicitly unsupported platforms
+    if sys.platform == "darwin" and os.uname().machine == "x86_64":
+        print(color(
+            "⚠️ WARNING: macOS x86_64 (Intel) is explicitly unsupported.\n"
+            "We no longer accept PRs or provide fixes for this platform.\n"
+            "Consider migrating to a supported platform (macOS arm64 / Apple Silicon).",
+            Colors.YELLOW,
+        ))
+        print()
 
     _section("Security Advisories")
     try:

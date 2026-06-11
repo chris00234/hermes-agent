@@ -1,3 +1,11 @@
+# ⚠️ DEPRECATED
+
+This Homebrew formula is **discontinued and no longer receives updates**.
+Please use a supported installation method (curl installer, Docker, or Nix).
+See https://hermes-agent.nousresearch.com/ for details.
+
+---
+
 Homebrew packaging notes for Hermes Agent.
 
 Use `packaging/homebrew/hermes-agent.rb` as a tap or `homebrew-core` starting point.
