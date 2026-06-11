@@ -14,12 +14,14 @@ automatically.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 import logging
 from typing import Optional, Tuple
 
 import requests
+from hermes_cli.managed_uv import get_pip_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -165,8 +167,8 @@ def _ensure_qrcode_installed() -> bool:
 
     # Try uv first (Hermes convention), then pip
     for cmd in (
-        [sys.executable, "-m", "uv", "pip", "install", "qrcode"],
-        [sys.executable, "-m", "pip", "install", "-q", "qrcode"],
+        get_pip_cmd() + ["install", "qrcode"],
+        get_pip_cmd() + ["install", "-q", "qrcode"],
     ):
         try:
             subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

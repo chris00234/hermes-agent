@@ -16,11 +16,13 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import copy
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from hermes_cli.managed_uv import get_pip_cmd
 from hermes_cli.nous_subscription import get_nous_subscription_features
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 from utils import base_url_hostname
@@ -797,7 +799,7 @@ def _install_neutts_deps() -> bool:
     print()
     try:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", "neutts[all]", "--quiet"],
+            get_pip_cmd() + ["install", "-U", "neutts[all]", "--quiet"],
             check=True, timeout=300,
         )
         print_success("neutts installed successfully")
@@ -822,7 +824,7 @@ def _install_kittentts_deps() -> bool:
     print()
     try:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", wheel_url, "soundfile", "--quiet"],
+            get_pip_cmd() + ["install", "-U", wheel_url, "soundfile", "--quiet"],
             check=True, timeout=300,
         )
         print_success("kittentts installed successfully")
@@ -1286,7 +1288,7 @@ def setup_terminal_backend(config: dict):
                     )
                 else:
                     result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", "modal"],
+                        get_pip_cmd() + ["install", "modal"],
                         capture_output=True,
                         text=True,
                     )
@@ -1339,7 +1341,7 @@ def setup_terminal_backend(config: dict):
                 )
             else:
                 result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "daytona"],
+                    get_pip_cmd() + ["install", "daytona"],
                     capture_output=True,
                     text=True,
                 )
@@ -1989,7 +1991,7 @@ def _setup_matrix():
                     )
                 else:
                     result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", matrix_pkg],
+                        get_pip_cmd() + ["install", matrix_pkg],
                         capture_output=True, text=True,
                     )
                 if result.returncode == 0:

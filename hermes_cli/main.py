@@ -5778,7 +5778,7 @@ def _update_via_zip(args):
     # individually so update does not silently strip working capabilities.
     print("→ Updating Python dependencies...")
 
-    from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+    from hermes_cli.managed_uv import ensure_uv, get_pip_cmd, update_managed_uv
 
     # Keep managed uv current — runs `uv self update` if we already have one.
     update_managed_uv()
@@ -8022,7 +8022,7 @@ def _cmd_update_pip(args):
     print(f"→ Current version: {__version__}")
     print("→ Checking PyPI for updates...")
 
-    from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+    from hermes_cli.managed_uv import ensure_uv, get_pip_cmd, update_managed_uv
 
     # Keep managed uv current before using it.
     update_managed_uv()
@@ -8061,7 +8061,7 @@ def _cmd_update_pip(args):
             # interpreter, matching pip's default behaviour.
             cmd.insert(3, "--system")
     else:
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "hermes-agent"]
+        cmd = get_pip_cmd() + ["install", "--upgrade", "hermes-agent"]
 
     print(f"→ Running: {' '.join(cmd)}")
     run_kwargs = {}
@@ -8481,7 +8481,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the install + core-dependency verification completes below.
         _write_update_incomplete_marker()
         print("→ Updating Python dependencies...")
-        from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+        from hermes_cli.managed_uv import ensure_uv, get_pip_cmd, update_managed_uv
 
         # Keep managed uv current — runs `uv self update` if we already have one.
         update_managed_uv()
