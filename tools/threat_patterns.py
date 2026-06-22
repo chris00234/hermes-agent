@@ -99,7 +99,13 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     # ── Exfiltration via curl/wget/cat with secrets (applies everywhere) ──
     (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl", "all"),
     (r'wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget", "all"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all"),
+    # "strict" not "all": reading a secret file is an execution-surface risk
+    # (memory + skills, where an agent could be tricked into running it and then
+    # exfiltrating), but in CONTEXT docs (CLAUDE.md/SOUL.md/infra READMEs) a bare
+    # `cat <secret>` is documentation — e.g. local bearer-auth setup — not exfil.
+    # Actual exfiltration (curl/wget with a secret var, send-to-url) stays "all"/
+    # "strict" above, and this mirrors the sibling context_exfil pattern.
+    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "strict"),
     (r'(send|post|upload|transmit)\s+.*\s+(to|at)\s+https?://', "send_to_url", "strict"),
     (r'(include|output|print|share)\s+(?:\w+\s+)*(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict"),
 
