@@ -259,9 +259,10 @@ class TestClassicInjection:
         )
 
     def test_read_dotenv(self):
-        assert "read_secrets" in scan_for_threats(
-            "cat ~/.env", scope="all"
-        )
+        # read_secrets is "strict"-scope (memory/skills exec surface), not "all":
+        # a bare `cat <secret>` in a context doc is documentation, not exfil.
+        assert "read_secrets" in scan_for_threats("cat ~/.env", scope="strict")
+        assert "read_secrets" not in scan_for_threats("cat ~/.env", scope="all")
 
     def test_html_comment_injection(self):
         assert "html_comment_injection" in scan_for_threats(
