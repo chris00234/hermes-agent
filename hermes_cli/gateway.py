@@ -5277,6 +5277,12 @@ def generate_launchd_plist() -> str:
         <key>NumberOfFiles</key>
         <integer>{nofile_target}</integer>
     </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>{nofile_target}</integer>
+    </dict>
 """
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
