@@ -34,6 +34,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
+from agent.memory_lifecycle import MemoryLifecycle
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -460,6 +461,7 @@ class MemoryManager:
         # Futures are tracked by durability class so shutdown can give writes
         # a bounded FIFO drain, then explicitly report anything abandoned.
         self._background_futures: Dict[Future, str] = {}
+        self._memory_lifecycle = MemoryLifecycle(self._submit_background)
         self._shutting_down = False
         self._shutdown_drain_state: Dict[str, Any] = {
             "status": "not_started",
@@ -558,6 +560,9 @@ class MemoryManager:
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
         """
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return ""
         blocks = []
         for provider in self._providers:
             try:
@@ -569,7 +574,7 @@ class MemoryManager:
                     "Memory provider '%s' system_prompt_block() failed: %s",
                     provider.name, e,
                 )
-        return "\n\n".join(blocks)
+        return "\n\n".join(blocks) if self._memory_lifecycle.read_generation() == generation else ""
 
     # -- Prefetch / recall ---------------------------------------------------
 
@@ -597,6 +602,9 @@ class MemoryManager:
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -611,7 +619,7 @@ class MemoryManager:
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
+        return "\n\n".join(parts) if self._memory_lifecycle.read_generation() == generation else ""
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
@@ -678,6 +686,9 @@ class MemoryManager:
         Returns ``""`` when no provider injected memory this turn — callers can
         emit the result unconditionally.
         """
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return ""
         segments: List[str] = []
         for provider in self._providers:
             try:
@@ -698,7 +709,7 @@ class MemoryManager:
                 # count <= 0 → content injected but no discrete count (reflect).
                 detail = "recalled relevant memory"
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
-        return "  ".join(segments)
+        return "  ".join(segments) if self._memory_lifecycle.read_generation() == generation else ""
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
@@ -707,6 +718,7 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
+        generation = self._memory_lifecycle.generation()
         providers = list(self._providers)
         if not providers:
             return
@@ -716,6 +728,8 @@ class MemoryManager:
             return
 
         def _run() -> None:
+            if not self._memory_lifecycle.accepts_background(generation):
+                return
             for provider in providers:
                 try:
                     provider.queue_prefetch(clean_query, session_id=session_id)
@@ -766,6 +780,7 @@ class MemoryManager:
         before turn N+1; provider implementations don't need their own
         ordering guarantees.
         """
+        generation = self._memory_lifecycle.generation()
         providers = list(self._providers)
         if not providers:
             return
@@ -774,8 +789,11 @@ class MemoryManager:
         if not clean_user_content:
             return
         user_content = clean_user_content
+        messages = list(messages) if messages is not None else None
 
         def _run() -> None:
+            if not self._memory_lifecycle.accepts_background(generation):
+                return
             for provider in providers:
                 try:
                     if messages is not None and self._provider_sync_accepts_messages(provider):
@@ -801,7 +819,7 @@ class MemoryManager:
 
     # -- Background dispatch -------------------------------------------------
 
-    def _submit_background(self, fn, *, kind: str = "write") -> None:
+    def _submit_background(self, fn, *, kind: str = "write", inline_fallback: bool = True) -> Optional[Future]:
         """Queue ``fn`` on the serialized worker and track its durability class.
 
         The submitted callable is wrapped with the CALLER's contextvars:
@@ -815,9 +833,11 @@ class MemoryManager:
         from functools import partial
 
         ctx = contextvars.copy_context()
-        fn = partial(ctx.run, fn)
+        fn = partial(ctx.run, self._memory_lifecycle.run_worker, fn)
         executor = self._get_sync_executor()
         if executor is None:
+            if not inline_fallback:
+                return None
             if self._shutting_down:
                 logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
                 return
@@ -839,7 +859,10 @@ class MemoryManager:
                 future = executor.submit(fn)
                 self._background_futures[future] = kind
             future.add_done_callback(self._forget_background_future)
+            return future
         except RuntimeError:
+            if not inline_fallback:
+                return None
             if self._shutting_down:
                 logger.warning("Memory manager shut down during %s submission; task rejected", kind)
                 return
@@ -953,11 +976,17 @@ class MemoryManager:
         Returns JSON string result. Raises ValueError if no provider
         handles the tool.
         """
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return tool_error("Memory provider context is unavailable during an incomplete session transition")
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
-            return provider.handle_tool_call(tool_name, args, **kwargs)
+            result = provider.handle_tool_call(tool_name, args, **kwargs)
+            if self._memory_lifecycle.read_generation() != generation:
+                return tool_error("Memory provider session changed during this call")
+            return result
         except Exception as e:
             logger.error(
                 "Memory provider '%s' handle_tool_call(%s) failed: %s",
@@ -972,6 +1001,8 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        if self._memory_lifecycle.read_generation() is None:
+            return
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -1031,16 +1062,17 @@ class MemoryManager:
             except Exception as e:  # pragma: no cover - on_session_end guards per-provider
                 logger.warning("Session-boundary extraction failed: %s", e)
             try:
-                self.on_session_switch(
+                self._notify_session_switch(
                     new_session_id,
                     parent_session_id=parent_session_id,
                     reset=True,
                     reason=reason,
                 )
-            except Exception as e:  # pragma: no cover - on_session_switch guards per-provider
+            except Exception as e:
                 logger.warning("Session-boundary switch failed: %s", e)
+                raise
 
-        self._submit_background(_run)
+        self._memory_lifecycle.enqueue(_run, transition=True)
 
     def on_session_switch(
         self,
@@ -1068,6 +1100,20 @@ class MemoryManager:
         """
         if not new_session_id:
             return
+        options = dict(kwargs)
+        if rewound:
+            options["rewound"] = True
+        self._memory_lifecycle.call(
+            lambda: self._notify_session_switch(
+                new_session_id, parent_session_id=parent_session_id, reset=reset, **options
+            ),
+            transition=True, required=False,
+        )
+
+    def _notify_session_switch(
+        self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
+        rewound: bool = False, **kwargs,
+    ) -> None:
         # Only forward ``rewound`` when it's actually set. Passing it
         # unconditionally would inject ``rewound=False`` into every
         # provider's **kwargs for the common /resume, /branch, /new, and
@@ -1076,6 +1122,7 @@ class MemoryManager:
         # rewound=True explicitly; everyone else stays clean.
         if rewound:
             kwargs["rewound"] = True
+        failed = False
         for provider in self._providers:
             try:
                 provider.on_session_switch(
@@ -1085,10 +1132,13 @@ class MemoryManager:
                     **kwargs,
                 )
             except Exception as e:
+                failed = True
                 logger.debug(
                     "Memory provider '%s' on_session_switch failed: %s",
                     provider.name, e,
                 )
+        if failed:
+            raise RuntimeError("A memory provider did not complete the session transition")
 
     def supports_pre_compress_checkpoint(
         self,
@@ -1134,6 +1184,20 @@ class MemoryManager:
         its exception is propagated so the caller can preserve the
         uncompressed transcript.
         """
+        snapshot = list(messages)
+        evidence_snapshot = list(evidence_messages) if evidence_messages is not None else None
+        return self._memory_lifecycle.call(
+            lambda: self._notify_pre_compress(
+                snapshot, evidence_messages=evidence_snapshot, require_checkpoint=require_checkpoint,
+                checkpoint_api_version=checkpoint_api_version,
+            ),
+            transition=False, required=require_checkpoint,
+        ) or ""
+
+    def _notify_pre_compress(
+        self, messages: List[Dict[str, Any]], *, evidence_messages: Optional[List[Dict[str, Any]]] = None,
+        require_checkpoint: bool = False, checkpoint_api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION,
+    ) -> str:
         parts = []
         checkpoint_succeeded = False
         for provider in self._providers:
