@@ -5,6 +5,7 @@ api_server_runs.py side of the private native execution lane.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -36,12 +37,20 @@ SECRET = "private-grant-secret-0123456789"
 GRANT_HEADER = "X-Hermes-Private-Grant"
 
 
-def _grant(attempt_id: str = "attempt-1", expiry_delta: int = 600) -> str:
+GRANT_TOOLSETS = ("shell",)
+
+
+def _grant(
+    attempt_id: str = "attempt-1",
+    expiry_delta: int = 600,
+    toolsets: tuple = GRANT_TOOLSETS,
+) -> str:
     return mint_grant(
         SECRET,
         attempt_id=attempt_id,
         expiry=int(time.time()) + expiry_delta,
         profile="default",
+        toolsets=toolsets,
     )
 
 
@@ -66,13 +75,10 @@ async def _wait_status(cli, run_id, want, headers=None):
 
 
 def _status_rows(path):
-    conn = sqlite3.connect(str(path))
-    try:
+    with contextlib.closing(sqlite3.connect(str(path))) as conn:
         return conn.execute(
             "SELECT run_id, status_json FROM run_idempotency"
         ).fetchall()
-    finally:
-        conn.close()
 
 
 @pytest.fixture(autouse=True)
@@ -94,8 +100,8 @@ class TestGrantAdmission:
                 create.return_value = _done_agent()
                 resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "hello", "allowed_toolsets": ["shell", "memory"]},
-                    headers={GRANT_HEADER: _grant()},
+                    json={"input": "hello"},
+                    headers={GRANT_HEADER: _grant(toolsets=("web", "shell"))},
                 )
                 assert resp.status == 202
                 run_id = (await resp.json())["run_id"]
@@ -107,7 +113,8 @@ class TestGrantAdmission:
         policy = create.call_args.kwargs["private_execution_policy"]
         assert policy.run_id == run_id
         assert policy.execution_attempt_id == "attempt-1"
-        assert policy.allowed_toolsets == frozenset({"shell"})
+        # Toolsets come from the grant, never the body.
+        assert policy.allowed_toolsets == frozenset({"shell", "web"})
         assert create.call_args.kwargs["session_id"] == run_id
         task_id = create.return_value.run_conversation.call_args.kwargs["task_id"]
         assert task_id == run_id
@@ -117,13 +124,18 @@ class TestGrantAdmission:
         "bad_grant",
         [
             "garbage",
-            "v1.attempt-1.notanumber.deadbeef",
+            "v2.attempt-1.notanumber.shell.deadbeef",
             "v9" + _grant()[2:],
+            # Well-formed v1 grant: the v1 lane is retired everywhere.
+            "v1.attempt-1.2000000000." + "0" * 64,
+            # Excluded toolset name signed into the segment.
+            f"v2.attempt-1.2000000000.memory.{'0' * 64}",
             mint_grant(
                 "wrong-secret-0123456789abcdef",
                 attempt_id="attempt-1",
                 expiry=2_000_000_000,
                 profile="default",
+                toolsets=GRANT_TOOLSETS,
             ),
         ],
     )
@@ -302,7 +314,7 @@ class TestGrantAdmission:
                 GRANT_HEADER: _grant(),
             },
         )
-        attempt_id, _expiry, err = runs_mod._verify_private_grant_admission(
+        attempt_id, _expiry, _toolsets, err = runs_mod._verify_private_grant_admission(
             adapter, request, _api_server=api_server_mod
         )
         assert attempt_id is None
@@ -340,6 +352,7 @@ class TestGrantAdmission:
                             attempt_id="attempt-1",
                             expiry=int(time.time()) + 600,
                             profile="servingp",
+                            toolsets=GRANT_TOOLSETS,
                         )
                     },
                 )
@@ -404,6 +417,74 @@ class TestLinkageRejection:
         adapter._response_store.get.assert_not_called()
         history.assert_not_called()
         assert adapter._run_statuses == {}
+
+
+class TestGrantToolsets:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body_toolsets",
+        [
+            ["web"],  # different set
+            ["shell", "web", "extra"],  # superset of the grant
+            [],  # empty differs from the grant's named set
+            None,  # carried-but-null is not absent
+            "shell",  # non-list fails closed
+            ["shell", 42],  # non-string entry fails closed
+        ],
+    )
+    async def test_body_toolsets_differing_from_grant_400(
+        self, adapter, body_toolsets
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                create.return_value = _done_agent()
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "allowed_toolsets": body_toolsets,
+                    },
+                    headers={GRANT_HEADER: _grant(toolsets=("shell", "web"))},
+                )
+                body = await resp.json()
+        assert resp.status == 400
+        assert body["error"]["code"] == "private_grant_toolsets_mismatch"
+        create.assert_not_called()
+        assert adapter._run_statuses == {}
+        assert adapter._private_run_ids == set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body_toolsets",
+        [
+            ["shell", "web"],
+            ["web", "shell", "shell"],  # same set, non-canonical order/dups
+        ],
+    )
+    async def test_body_toolsets_matching_grant_admitted(
+        self, adapter, body_toolsets
+    ):
+        app = _create_runs_app(adapter)
+        grant = _grant(toolsets=("shell", "web"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                create.return_value = _done_agent()
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "allowed_toolsets": body_toolsets,
+                    },
+                    headers={GRANT_HEADER: grant},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                await _wait_status(
+                    cli, run_id, {"completed"}, headers={GRANT_HEADER: grant}
+                )
+        policy = create.call_args.kwargs["private_execution_policy"]
+        assert policy.allowed_toolsets == frozenset({"shell", "web"})
 
 
 class TestMetadataOnlyDurableStatus:
@@ -827,6 +908,96 @@ class TestPrivateIdempotencyScope:
                 assert replay.status == 202
                 replay_body = await replay.json()
                 assert replay_body["run_id"] == private_run
+                assert replay.headers["Idempotency-Replayed"] == "true"
+                await asyncio.sleep(0.2)
+
+
+class TestPrivateGrantFingerprint:
+    """The signed grant is part of the private request identity (finding
+    api_server_runs.py:813): a same-key retry with a different grant must
+    409, never replay a run whose policy came from the original grant."""
+
+    @pytest.mark.asyncio
+    async def test_same_key_same_grant_replays(self, adapter, tmp_path):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        headers = {GRANT_HEADER: _grant(), "Idempotency-Key": "grant-fp"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                create.return_value = _done_agent()
+                first = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=headers
+                )
+                assert first.status == 202
+                run_id = (await first.json())["run_id"]
+                replay = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=headers
+                )
+                assert replay.status == 202
+                assert (await replay.json())["run_id"] == run_id
+                assert replay.headers["Idempotency-Replayed"] == "true"
+                await asyncio.sleep(0.2)
+
+    @pytest.mark.asyncio
+    async def test_same_key_different_grant_toolsets_conflicts(
+        self, adapter, tmp_path
+    ):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        expiry = int(time.time()) + 600
+
+        def grant_for(toolsets):
+            return mint_grant(
+                SECRET,
+                attempt_id="attempt-1",
+                expiry=expiry,
+                profile="default",
+                toolsets=toolsets,
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                create.return_value = _done_agent()
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "same"},
+                    headers={
+                        GRANT_HEADER: grant_for(("shell",)),
+                        "Idempotency-Key": "grant-fp",
+                    },
+                )
+                assert first.status == 202
+                conflict = await cli.post(
+                    "/v1/runs",
+                    json={"input": "same"},
+                    headers={
+                        GRANT_HEADER: grant_for(("shell", "web")),
+                        "Idempotency-Key": "grant-fp",
+                    },
+                )
+                assert conflict.status == 409
+                body = await conflict.json()
+                assert body["error"]["code"] == "idempotency_key_conflict"
+                await asyncio.sleep(0.2)
+
+    @pytest.mark.asyncio
+    async def test_public_runs_fingerprint_unchanged(self, adapter, tmp_path):
+        _use_idempotency_db(adapter, tmp_path / "idem.db")
+        app = _create_runs_app(adapter)
+        headers = {"Idempotency-Key": "public-fp"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                create.return_value = _done_agent()
+                first = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=headers
+                )
+                assert first.status == 202
+                run_id = (await first.json())["run_id"]
+                replay = await cli.post(
+                    "/v1/runs", json={"input": "same"}, headers=headers
+                )
+                assert replay.status == 202
+                assert (await replay.json())["run_id"] == run_id
                 assert replay.headers["Idempotency-Replayed"] == "true"
                 await asyncio.sleep(0.2)
 

@@ -1,8 +1,9 @@
-"""Unit tests for the private-execution policy object and grant verification.
+"""Unit tests for the private-execution policy object.
 
-DE_DESIGN §8 step 1: frozen policy dataclass, ContextVar accessors, versioned
-HMAC grant mint/verify, always-excluded toolsets, and fail-closed secret
-resolution for the private /v1/runs lane.
+DE_DESIGN §8 step 1: frozen policy dataclass, ContextVar accessors,
+always-excluded toolsets, and fail-closed secret resolution for the
+private /v1/runs lane. Grant mint/verify unit tests live in
+``test_private_execution_grant.py``.
 """
 
 import dataclasses
@@ -14,101 +15,17 @@ from gateway.private_execution_policy import (
     ALWAYS_EXCLUDED_TOOLSETS,
     GRANT_SECRET_ENV,
     GRANT_VERSION,
-    GrantError,
     PrivateExecutionPolicy,
     bind_private_policy,
     build_policy,
     current_private_policy,
-    mint_grant,
     reset_private_policy,
     resolve_private_grant_secret,
-    verify_grant,
 )
 from tools.thread_context import propagate_context_to_thread
 
 SECRET = "unit-test-grant-secret-0123456789abcdef"
 PROFILE = "design"
-NOW = 1_757_000_000
-
-
-def _grant(**overrides):
-    kwargs = {"attempt_id": "attempt_1", "expiry": NOW + 600, "profile": PROFILE}
-    kwargs.update(overrides)
-    return mint_grant(SECRET, **kwargs)
-
-
-class TestVerifyGrant:
-    def test_valid_grant_returns_attempt_and_expiry(self):
-        attempt_id, expiry = verify_grant(
-            _grant(), SECRET, profile=PROFILE, now=NOW
-        )
-        assert attempt_id == "attempt_1"
-        assert expiry == NOW + 600
-
-    def test_expired_grant_rejected(self):
-        grant = _grant(expiry=NOW - 1)
-        with pytest.raises(GrantError, match="expired"):
-            verify_grant(grant, SECRET, profile=PROFILE, now=NOW)
-
-    def test_expiry_equal_to_now_rejected(self):
-        grant = _grant(expiry=NOW)
-        with pytest.raises(GrantError, match="expired"):
-            verify_grant(grant, SECRET, profile=PROFILE, now=NOW)
-
-    @pytest.mark.parametrize(
-        "header",
-        [
-            "",
-            "v1",
-            "v1.attempt_1",
-            "v1.attempt_1.123",
-            "v1.attempt_1.123.deadbeef.extra",
-            "v1..123." + "0" * 64,
-            "v1.attempt_1.notanint." + "0" * 64,
-            "v1.attempt_1.٣٣٣." + "0" * 64,
-            "v1.attempt_1.123.nothex",
-            "v1.attempt_1.123." + "Z" * 64,
-            None,
-            42,
-        ],
-    )
-    def test_malformed_grant_rejected(self, header):
-        with pytest.raises(GrantError, match="malformed"):
-            verify_grant(header, SECRET, profile=PROFILE, now=NOW)
-
-    def test_unknown_version_rejected(self):
-        tampered = "v2" + _grant()[2:]
-        with pytest.raises(GrantError, match="version"):
-            verify_grant(tampered, SECRET, profile=PROFILE, now=NOW)
-
-    def test_wrong_profile_rejected(self):
-        grant = _grant(profile="liz")
-        with pytest.raises(GrantError, match="authentic"):
-            verify_grant(grant, SECRET, profile=PROFILE, now=NOW)
-
-    def test_tampered_mac_rejected(self):
-        grant = _grant()
-        head, mac = grant.rsplit(".", 1)
-        flipped = ("0" if mac[0] != "0" else "1") + mac[1:]
-        with pytest.raises(GrantError, match="authentic"):
-            verify_grant(f"{head}.{flipped}", SECRET, profile=PROFILE, now=NOW)
-
-    def test_wrong_secret_rejected(self):
-        with pytest.raises(GrantError, match="authentic"):
-            verify_grant(
-                _grant(), "another-secret-value-0123456789ab", profile=PROFILE, now=NOW
-            )
-
-    def test_tampered_attempt_id_rejected(self):
-        parts = _grant().split(".")
-        parts[1] = "attempt_2"
-        with pytest.raises(GrantError, match="authentic"):
-            verify_grant(".".join(parts), SECRET, profile=PROFILE, now=NOW)
-
-    @pytest.mark.parametrize("secret", [None, "", "short"])
-    def test_missing_secret_fails_closed(self, secret):
-        with pytest.raises(GrantError, match="disabled"):
-            verify_grant(_grant(), secret, profile=PROFILE, now=NOW)
 
 
 class TestBuildPolicy:

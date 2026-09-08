@@ -170,7 +170,7 @@ def _private_grant_attempt_id(
         return None
     secret = resolve_private_grant_secret(profile)
     try:
-        attempt_id, _expiry = verify_grant(
+        attempt_id, _expiry, _toolsets = verify_grant(
             header, secret, profile=profile, now=time.time()
         )
     except GrantError:
@@ -179,7 +179,10 @@ def _private_grant_attempt_id(
 
 
 def _verify_private_grant_admission(self, request: "web.Request", *, _api_server):
-    """Verify the grant on POST /v1/runs; return (attempt_id, expiry, error)."""
+    """Verify the grant on POST /v1/runs.
+
+    Returns ``(attempt_id, expiry, toolsets, error)``.
+    """
     _openai_error = _api_server._openai_error
 
     def _denied(message: str) -> "web.Response":
@@ -189,29 +192,29 @@ def _verify_private_grant_admission(self, request: "web.Request", *, _api_server
 
     query_err = _reject_query_grant(self, request, _api_server=_api_server)
     if query_err is not None:
-        return None, 0, query_err
+        return None, 0, (), query_err
     header = request.headers.get(_PRIVATE_GRANT_HEADER)
     if header is None:
-        return None, 0, None
+        return None, 0, (), None
     if self._room_grant_token(request):
         # A room-token caller must never mint a private policy: the private
         # idempotency scope is grant-derived, not room-derived.
-        return None, 0, _denied(
+        return None, 0, (), _denied(
             "Private execution grants cannot ride room authority."
         )
     profile = _grant_serving_profile(_api_server=_api_server)
     if profile is None:
-        return None, 0, _denied(
+        return None, 0, (), _denied(
             "Gateway profile identity is unavailable."
         )
     secret = resolve_private_grant_secret(profile)
     try:
-        attempt_id, expiry = verify_grant(
+        attempt_id, expiry, toolsets = verify_grant(
             header, secret, profile=profile, now=time.time()
         )
     except GrantError as exc:
-        return None, 0, _denied(str(exc))
-    return attempt_id, expiry, None
+        return None, 0, (), _denied(str(exc))
+    return attempt_id, expiry, toolsets, None
 
 
 def _reject_private_linkage(body, gateway_session_key, *, _openai_error):
@@ -236,19 +239,42 @@ def _reject_private_linkage(body, gateway_session_key, *, _openai_error):
     )
 
 
-def _mint_private_policy(body, *, run_id, attempt_id, expiry, profile):
+def _reject_private_toolsets_mismatch(body, grant_toolsets, *, _openai_error):
+    """400-reject a body ``allowed_toolsets`` that differs from the grant.
+
+    The grant is the sole toolset authority; an absent body field is fine,
+    anything else must name exactly the grant's set (fail closed).
+    """
+    if "allowed_toolsets" not in body:
+        return None
+    raw = body.get("allowed_toolsets")
+    normalized = (
+        sorted(set(raw))
+        if isinstance(raw, list) and all(isinstance(item, str) for item in raw)
+        else None
+    )
+    if normalized == sorted(grant_toolsets):
+        return None
+    return web.json_response(
+        _openai_error(
+            "Private run allowed_toolsets must match the grant.",
+            code="private_grant_toolsets_mismatch",
+        ),
+        status=400,
+    )
+
+
+def _mint_private_policy(*, run_id, attempt_id, expiry, profile, toolsets):
     """Derive the immutable policy server-side from the verified grant."""
     from datetime import datetime, timezone
 
-    raw_toolsets = body.get("allowed_toolsets") or []
-    allowed = [item for item in raw_toolsets if isinstance(item, str)]
     lease = datetime.fromtimestamp(int(expiry), tz=timezone.utc).isoformat()
     return build_policy(
         run_id=run_id,
         profile=profile,
         execution_attempt_id=attempt_id,
         lease_expires_at=lease,
-        allowed_toolsets=allowed,
+        allowed_toolsets=toolsets,
     )
 
 
@@ -704,7 +730,7 @@ async def _handle_runs(
         # Private-lane precedence: a session-key header is a 400-rejected
         # linkage vector when a grant rides the request, even where the
         # public lane would 403 the header itself (DE_DESIGN §1.1 #14).
-        attempt_id, _expiry, grant_err = _verify_private_grant_admission(
+        attempt_id, _expiry, _toolsets, grant_err = _verify_private_grant_admission(
             self, request, _api_server=_api_server
         )
         if grant_err is not None:
@@ -739,7 +765,7 @@ async def _handle_runs(
     # Private lane admission (DE_DESIGN §4): verify the grant after auth and
     # before the response-store lookup, history load, and session precedence.
     # Invalid/expired/malformed => 403 with no run and no reservation consumed.
-    private_attempt_id, private_grant_expiry, grant_err = (
+    private_attempt_id, private_grant_expiry, private_grant_toolsets, grant_err = (
         _verify_private_grant_admission(self, request, _api_server=_api_server)
     )
     if grant_err is not None:
@@ -763,6 +789,11 @@ async def _handle_runs(
         )
         if linkage_err is not None:
             return linkage_err
+        mismatch_err = _reject_private_toolsets_mismatch(
+            body, private_grant_toolsets, _openai_error=_openai_error
+        )
+        if mismatch_err is not None:
+            return mismatch_err
 
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
     if idempotency_key and (
@@ -779,13 +810,23 @@ async def _handle_runs(
     idempotency_scope = (
         self._run_idempotency_scope(request) if idempotency_key else ""
     )
+    fingerprinted = {
+        "body": body,
+        "gateway_session_key": gateway_session_key or "",
+    }
+    if private_attempt_id is not None:
+        # The verified grant is part of the private request identity: a
+        # same-key retry carrying a different grant (toolsets/expiry) must
+        # 409, never replay a run whose policy was minted from the
+        # original grant.
+        fingerprinted["private_grant"] = {
+            "toolsets": ",".join(private_grant_toolsets),
+            "expiry": private_grant_expiry,
+        }
     idempotency_fingerprint = (
         hashlib.sha256(
             json.dumps(
-                {
-                    "body": body,
-                    "gateway_session_key": gateway_session_key or "",
-                },
+                fingerprinted,
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
@@ -939,11 +980,11 @@ async def _handle_runs(
         # explicitly anyway so the run id is always the session identity.
         session_id = run_id
         private_policy = _mint_private_policy(
-            body,
             run_id=run_id,
             attempt_id=private_attempt_id,
             expiry=private_grant_expiry,
             profile=_api_request_profile.get() or "default",
+            toolsets=private_grant_toolsets,
         )
         self._private_run_ids.add(run_id)
     # Approval queues gate host-side tool execution and must be isolated

@@ -18,8 +18,9 @@ from typing import Any, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
-GRANT_VERSION = "v1"
+GRANT_VERSION = "v2"
 GRANT_SECRET_ENV = "PRIVATE_EXEC_GRANT_KEY"
+MAX_GRANT_TOOLSETS = 16
 
 # A delegated child agent or cross-agent message would not inherit the policy
 # fences, and the memory toolset is a durable sink — always stripped.
@@ -37,6 +38,7 @@ ALWAYS_DENIED_TOOLS = frozenset({"delegate_task", "message_agent"})
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EXPIRY_RE = re.compile(r"^[0-9]{1,20}$")
 _MAC_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_TOOLSET_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class GrantError(ValueError):
@@ -98,17 +100,84 @@ def build_policy(
     )
 
 
-def _grant_mac(secret: str, *, attempt_id: str, expiry: int, profile: str) -> str:
-    message = f"{GRANT_VERSION}|{attempt_id}|{expiry}|{profile}".encode()
+def _normalize_grant_toolsets(toolsets: Iterable[str]) -> tuple[str, ...]:
+    """Canonical (sorted, deduplicated) toolset names for the grant segment."""
+
+    names = sorted({str(item) for item in toolsets})
+    if not 1 <= len(names) <= MAX_GRANT_TOOLSETS:
+        raise GrantError("grant toolsets are invalid")
+    for name in names:
+        if (
+            _TOOLSET_NAME_RE.fullmatch(name) is None
+            or name in ALWAYS_EXCLUDED_TOOLSETS
+        ):
+            raise GrantError("grant toolsets are invalid")
+    return tuple(names)
+
+
+def _parse_grant_toolsets_segment(segment: str) -> tuple[str, ...]:
+    """Parse a grant's toolsets segment; only the canonical form verifies."""
+
+    names = tuple(segment.split(","))
+    if _normalize_grant_toolsets(names) != names:
+        raise GrantError("grant toolsets are invalid")
+    return names
+
+
+def _grant_mac(
+    secret: str, *, attempt_id: str, expiry: int, profile: str, toolsets_segment: str
+) -> str:
+    message = (
+        f"{GRANT_VERSION}|{attempt_id}|{expiry}|{profile}|{toolsets_segment}".encode()
+    )
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
-def mint_grant(secret: str, *, attempt_id: str, expiry: int, profile: str) -> str:
-    """Mint a ``v1`` grant header value (tests and the Brain bridge)."""
+def mint_grant(
+    secret: str,
+    *,
+    attempt_id: str,
+    expiry: int,
+    profile: str,
+    toolsets: Iterable[str],
+) -> str:
+    """Mint a ``v2`` grant header value (tests and the Brain bridge)."""
 
     expiry = int(expiry)
-    mac = _grant_mac(secret, attempt_id=attempt_id, expiry=expiry, profile=profile)
-    return f"{GRANT_VERSION}.{attempt_id}.{expiry}.{mac}"
+    segment = ",".join(_normalize_grant_toolsets(toolsets))
+    mac = _grant_mac(
+        secret,
+        attempt_id=attempt_id,
+        expiry=expiry,
+        profile=profile,
+        toolsets_segment=segment,
+    )
+    return f"{GRANT_VERSION}.{attempt_id}.{expiry}.{segment}.{mac}"
+
+
+def _split_grant(header_value: Any) -> tuple[str, str, str, str]:
+    """Structural parse: ``(attempt_id, raw_expiry, toolsets_segment, mac)``."""
+
+    if not isinstance(header_value, str):
+        raise GrantError("grant is malformed")
+    version, sep, rest = header_value.strip().partition(".")
+    if not sep:
+        raise GrantError("grant is malformed")
+    if version != GRANT_VERSION:
+        raise GrantError("grant version is unsupported")
+    # attempt_id may contain dots; expiry/toolsets/mac never do, so parse
+    # the fixed tail from the right.
+    parts = rest.rsplit(".", 3)
+    if len(parts) != 4:
+        raise GrantError("grant is malformed")
+    attempt_id, raw_expiry, toolsets_segment, supplied_mac = parts
+    if (
+        _ATTEMPT_ID_RE.fullmatch(attempt_id) is None
+        or _EXPIRY_RE.fullmatch(raw_expiry) is None
+        or _MAC_HEX_RE.fullmatch(supplied_mac) is None
+    ):
+        raise GrantError("grant is malformed")
+    return attempt_id, raw_expiry, toolsets_segment, supplied_mac
 
 
 def verify_grant(
@@ -117,36 +186,33 @@ def verify_grant(
     *,
     profile: str,
     now: float,
-) -> tuple[str, int]:
-    """Validate a grant header; return ``(execution_attempt_id, expiry)``.
+) -> tuple[str, int, tuple[str, ...]]:
+    """Validate a grant header; return ``(attempt_id, expiry, toolsets)``.
 
     Fail-closed: no usable secret means the lane is disabled and every grant
-    is rejected. Raises :class:`GrantError` on any defect.
+    is rejected; ``v1`` (and any non-``v2``) grants are rejected everywhere.
+    Raises :class:`GrantError` on any defect.
     """
 
     if not isinstance(secret, str) or len(secret) < 16:
         raise GrantError("private execution lane is disabled")
-    if not isinstance(header_value, str):
-        raise GrantError("grant is malformed")
-    parts = header_value.strip().split(".")
-    if len(parts) != 4:
-        raise GrantError("grant is malformed")
-    version, attempt_id, raw_expiry, supplied_mac = parts
-    if (
-        _ATTEMPT_ID_RE.fullmatch(attempt_id) is None
-        or _EXPIRY_RE.fullmatch(raw_expiry) is None
-        or _MAC_HEX_RE.fullmatch(supplied_mac) is None
-    ):
-        raise GrantError("grant is malformed")
-    if version != GRANT_VERSION:
-        raise GrantError("grant version is unsupported")
+    attempt_id, raw_expiry, toolsets_segment, supplied_mac = _split_grant(
+        header_value
+    )
+    toolsets = _parse_grant_toolsets_segment(toolsets_segment)
     expiry = int(raw_expiry)
-    expected = _grant_mac(secret, attempt_id=attempt_id, expiry=expiry, profile=profile)
+    expected = _grant_mac(
+        secret,
+        attempt_id=attempt_id,
+        expiry=expiry,
+        profile=profile,
+        toolsets_segment=toolsets_segment,
+    )
     if not hmac.compare_digest(supplied_mac, expected):
         raise GrantError("grant is not authentic")
     if expiry <= now:
         raise GrantError("grant is expired")
-    return attempt_id, expiry
+    return attempt_id, expiry, toolsets
 
 
 def resolve_private_grant_secret(profile: str | None) -> str | None:
