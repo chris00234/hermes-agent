@@ -6608,12 +6608,17 @@ class TurnRunner:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
+            from tools.clarify_evidence import for_source as _clarify_evidence_for_source
+
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                evidence=_clarify_evidence_for_source(
+                    ctx.source, clarify_id, question, choices, multi_select,
+                ),
             )
 
             # For WeCom native streaming: finalize the current stream before
@@ -12125,7 +12130,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
-        for agent in active_agents.values():
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        for session_key, agent in active_agents.items():
+            clear_clarify(session_key, reason="shutdown")
             # Persist any in-flight transcript to the SQLite session store
             # before teardown (#13121).  An agent forcibly interrupted by the
             # drain-timeout escalation may never reach
@@ -17901,6 +17909,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             if not self._is_user_authorized_for_source(source):
                 return
+            if event.get("event_type") in {"clarify_original_candidate", "clarify_original_edited"}:
+                from gateway.telegram_clarify_evidence import authorize_candidate
+
+                return authorize_candidate(event, source)
             invoke_hook("gateway_platform_event", **event)
         except Exception:
             # Observer failures must never break the adapter's update loop.
@@ -19191,8 +19203,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
+                from tools.clarify_evidence import selected_for_event
+
                 _text_outcome = _clarify_mod.attempt_text_response_for_session(
                     _quick_key, _raw_clarify_reply,
+                    selected_reply=selected_for_event(event, _raw_clarify_reply),
                 )
                 if _text_outcome == _clarify_mod.TEXT_RESOLVED:
                     logger.info(
@@ -29795,6 +29810,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return
 
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        clear_clarify(session_key, reason="reset")
+
         pending_skills_reload_notes = getattr(
             self, "_pending_skills_reload_notes", None
         )
@@ -29851,6 +29870,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        clear_clarify(session_key)
         generation = self._begin_session_run_generation(session_key)
         if reason:
             logger.info(
@@ -30249,6 +30271,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         if id(agent) in running_ids:
             return
+
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        clear_clarify(session_key, reason="evicted")
 
         try:
             threading.Thread(

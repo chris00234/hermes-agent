@@ -35,7 +35,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from tools.clarify_evidence import ClarifyEvidence, OriginalReply
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    evidence: Optional[ClarifyEvidence] = None
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -83,6 +87,8 @@ def register(
     question: str,
     choices: Optional[List[str]],
     multi_select: bool = False,
+    *,
+    evidence: Optional[ClarifyEvidence] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -97,6 +103,7 @@ def register(
         multi_select=bool(multi_select) and bool(choices),
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
+        evidence=evidence,
     )
     with _lock:
         _entries[clarify_id] = entry
@@ -147,6 +154,8 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 
     with _lock:
         # Remove from indices regardless of resolution outcome.
+        if entry.evidence and not entry.event.is_set():
+            entry.evidence.close("timeout")
         _entries.pop(clarify_id, None)
         ids = _session_index.get(entry.session_key)
         if ids and clarify_id in ids:
@@ -161,7 +170,9 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 # Public API — gateway / adapter side
 # =========================================================================
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
+def resolve_gateway_clarify(
+    clarify_id: str, response: str, *, selected_reply: Optional[OriginalReply] = None,
+) -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
 
     Returns True if an entry was found and resolved, False otherwise
@@ -172,6 +183,8 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
         if entry is None or entry.event.is_set():
             return False
         entry.response = str(response) if response is not None else ""
+        if entry.evidence:
+            entry.evidence.close("resolved" if entry.response else "cancelled", selected_reply)
         entry.event.set()
         return True
 
@@ -425,7 +438,9 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return _json.dumps(selected, ensure_ascii=False)
 
 
-def attempt_text_response_for_session(session_key: str, response: str) -> str:
+def attempt_text_response_for_session(
+    session_key: str, response: str, *, selected_reply: Optional[OriginalReply] = None,
+) -> str:
     """Try to resolve the oldest pending clarify in ``session_key`` from typed text.
 
     Returns one of:
@@ -446,7 +461,7 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
             return TEXT_REJECTED_SELECTION
         return TEXT_REJECTED_PROSE
 
-    if resolve_gateway_clarify(entry.clarify_id, coerced):
+    if resolve_gateway_clarify(entry.clarify_id, coerced, selected_reply=selected_reply):
         return TEXT_RESOLVED
     # Lost a race with a button/callback resolution — treat as no work left.
     return TEXT_NO_PENDING
@@ -483,7 +498,7 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in ids)
 
 
-def clear_session(session_key: str) -> int:
+def clear_session(session_key: str, *, reason: str = "cancelled") -> int:
     """Resolve and drop every pending clarify for a session.
 
     Used by session-boundary cleanup (e.g. ``/new``, gateway shutdown,
@@ -519,6 +534,8 @@ def clear_session(session_key: str) -> int:
             # alongside its own timeout deadline.  Most callers just treat any
             # falsy result as "user did not respond".
             entry.response = ""
+            if entry.evidence:
+                entry.evidence.close(reason)
             entry.event.set()
             cancelled += 1
     return cancelled

@@ -5873,6 +5873,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        from gateway.telegram_clarify_evidence import invalidate
+
+        invalidate(self, chat_id, message_id)
+
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
         # lists, task lists, <details>, block math) and rich is available,
@@ -6716,6 +6720,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._clarify_state[clarify_id] = session_key
+            from gateway.telegram_clarify_evidence import delivered
+
+            delivered(self, clarify_id, msg, question, choices, text)
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
@@ -7744,6 +7751,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     await query.answer(text="✏️ Type your answer in the chat.")
                     try:
+                        from gateway.telegram_clarify_evidence import invalidate
+
+                        invalidate(self, query_chat_id, query.message.message_id)
                         await query.edit_message_text(
                             text=f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
                             parse_mode=ParseMode.HTML,
@@ -10013,7 +10023,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
+        from gateway.telegram_clarify_evidence import candidate
+
+        raw_candidate = candidate(self, update, msg)
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        handler = getattr(self, "_platform_event_handler", None)
+        if raw_candidate is not None and handler is not None:
+            try:
+                event._clarify_original_reply = await handler(
+                    raw_candidate, self._source_from_message_for_auth(msg),
+                )
+            except Exception:
+                logger.debug("Clarify evidence dispatch failed", exc_info=True)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
