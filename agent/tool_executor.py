@@ -21,6 +21,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from agent.display import (
@@ -50,6 +51,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
     extract_persisted_path,
+    generate_preview,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
@@ -371,6 +373,112 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
+def _private_lease_active(lease_expires_at: str) -> bool:
+    """True while the policy's ISO-UTC lease expiry is in the future."""
+    raw = str(lease_expires_at).strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    expires = datetime.fromisoformat(raw)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires > datetime.now(timezone.utc)
+
+
+def _private_execution_block_message(agent, function_name: str) -> str | None:
+    """Fail-closed private-execution gate (DE_DESIGN §5); None allows the call.
+
+    When either the private-policy ContextVar or
+    ``agent._private_execution_policy`` is set: both must be present and
+    digest-equal, the tool's registry toolset must be in
+    ``allowed_toolsets``, and the lease must be unexpired. Any accessor
+    error, absence-when-expected, mismatch, disallowed tool, or expired
+    lease blocks the call.
+    """
+    try:
+        from gateway.private_execution_policy import (
+            ALWAYS_DENIED_TOOLS,
+            current_private_policy,
+        )
+
+        context_policy = current_private_policy()
+        agent_policy = getattr(agent, "_private_execution_policy", None)
+    except Exception:
+        return "Tool blocked: private execution policy state is unreadable"
+    if context_policy is None and agent_policy is None:
+        return None
+    try:
+        if context_policy is None or agent_policy is None:
+            return "Tool blocked: private execution policy context is incomplete"
+        if context_policy.policy_digest != agent_policy.policy_digest:
+            return "Tool blocked: private execution policy mismatch"
+        if function_name in ALWAYS_DENIED_TOOLS:
+            # Denied by TOOL name regardless of registry toolset mapping —
+            # delegate_task lives in the "delegation" toolset and a child
+            # agent or cross-agent message would escape the policy fences.
+            return (
+                f"Tool blocked: {function_name} is never allowed under a "
+                "private execution grant"
+            )
+        from tools.registry import registry
+
+        toolset = registry.get_toolset_for_tool(function_name)
+        if toolset is None or toolset not in context_policy.allowed_toolsets:
+            return (
+                f"Tool blocked: {function_name} is outside the private "
+                "execution grant"
+            )
+        if not _private_lease_active(context_policy.lease_expires_at):
+            return "Tool blocked: private execution lease expired"
+    except Exception:
+        return "Tool blocked: private execution policy check failed"
+    return None
+
+
+def _persist_or_truncate_tool_result(
+    agent,
+    *,
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    effective_task_id: str,
+    config: BudgetConfig,
+) -> str:
+    """Spillover persistence, or in-memory truncation for policy-bound runs.
+
+    A run carrying the private execution policy must never write raw tool
+    results to ``$HERMES_HOME/cache/spillover`` (DE_DESIGN §1.1 #18); its
+    oversized results are truncated in memory instead. Fail-closed: an
+    unreadable policy state also truncates rather than persisting.
+    """
+    try:
+        from gateway.private_execution_policy import current_private_policy
+
+        policy_bound = (
+            current_private_policy() is not None
+            or getattr(agent, "_private_execution_policy", None) is not None
+        )
+    except Exception:
+        policy_bound = True
+    if not policy_bound:
+        return maybe_persist_tool_result(
+            content=content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            env=get_active_env(effective_task_id),
+            config=config,
+        )
+    threshold = config.resolve_threshold(tool_name)
+    if threshold == float("inf") or len(content) <= threshold:
+        return content
+    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    suffix = "\n..." if has_more else ""
+    return (
+        f"{preview}{suffix}\n\n"
+        f"[Truncated in memory: tool result was {len(content):,} chars; "
+        "private execution policy forbids spillover persistence.]"
+    )
+
+
 def _tool_search_scoped_names(agent) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
@@ -669,6 +777,14 @@ def _run_agent_tool_execution_middleware(
                 if authorization_gate is None
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
+
+        if block_message is None:
+            private_block_message = _private_execution_block_message(
+                agent, function_name
+            )
+            if private_block_message is not None:
+                block_message = private_block_message
+                block_error_type = "private_execution_grant_block"
 
         guardrail_decision = None
         if block_message is None:
@@ -1820,11 +1936,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
+        function_result = _persist_or_truncate_tool_result(
+            agent,
             content=function_result,
             tool_name=name,
             tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
+            effective_task_id=effective_task_id,
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
@@ -2749,11 +2866,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
+        function_result = _persist_or_truncate_tool_result(
+            agent,
             content=function_result,
             tool_name=function_name,
             tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
+            effective_task_id=effective_task_id,
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)

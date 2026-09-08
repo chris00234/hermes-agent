@@ -34,6 +34,7 @@ Optional hooks (override to opt in):
 from __future__ import annotations
 
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -46,6 +47,57 @@ logger = logging.getLogger(__name__)
 # the opt-in fail-closed checkpoint contract (normalized evidence handoff +
 # strict-mode failure propagation).
 PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
+PRE_SESSION_RESET_API_VERSION = 1
+
+
+class StatePreservingResetError(RuntimeError):
+    """Pre-session-reset failed BEFORE the provider acknowledged anything.
+
+    Raised by providers when the working-frame lifetime changed underneath
+    the frozen reference (server 409 "working frame lifetime changed") or on
+    validation/transport failures that precede any acknowledgement. The host
+    fails the /reset //undo closed but treats the attempt as transition-
+    neutral: no provider state changed, so the memory lifecycle stays usable.
+    """
+
+
+def sanitize_working_frame_reference(value: Any) -> Optional[Dict[str, Any]]:
+    """Validate bounded ACK identity metadata without retaining frame content."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Invalid working frame reference")
+    result = {}
+    limits = {"provider": 64, "principal": 128, "agent": 128, "project": 128,
+              "session_id": 256, "logical_task_id": 128}
+    for key, limit in limits.items():
+        item = value.get(key)
+        if not isinstance(item, str) or len(item.encode("utf-8")) > limit:
+            raise ValueError("Invalid working frame reference identity")
+        if (not item and key != "project") or any(ord(char) < 32 for char in item):
+            raise ValueError("Invalid working frame reference identity")
+        result[key] = item
+    for key in ("revision", "lifecycle_epoch"):
+        item = value.get(key)
+        if key == "lifecycle_epoch" and item is None and value.get("cleared") is True:
+            continue
+        if type(item) is not int or not 0 < item < 2 ** 63:
+            raise ValueError("Invalid working frame reference revision")
+        result[key] = item
+    expires_at = value.get("expires_at")
+    if type(expires_at) not in (float, int) or not math.isfinite(expires_at) or expires_at <= 0:
+        raise ValueError("Invalid working frame reference expiry")
+    if type(value.get("cleared")) is not bool:
+        raise ValueError("Invalid working frame reference state")
+    result.update(expires_at=expires_at, cleared=value["cleared"])
+    if "source_session_id" in value or "source_revision" in value:
+        source, revision = value.get("source_session_id"), value.get("source_revision")
+        if (not isinstance(source, str) or not source or len(source.encode("utf-8")) > 256
+                or any(ord(char) < 32 for char in source)
+                or type(revision) is not int or not 0 < revision < 2 ** 63):
+            raise ValueError("Invalid working frame reference source")
+        result.update(source_session_id=source, source_revision=revision)
+    return result
 
 # Default glyph for the deterministic memory indicators. Providers override
 # per-status with their own brand mark (e.g. Hindsight uses "👁️").
@@ -115,6 +167,22 @@ class MemoryProvider(ABC):
     # (PRE_COMPRESS_CHECKPOINT_API_VERSION). Version 1 is the implicit
     # historical contract: best-effort semantics, raw message list.
     pre_compress_checkpoint_api_version = 1
+    pre_session_reset_api_version = 0
+
+    def working_frame_reference(self) -> Optional[Dict[str, Any]]:
+        """Return only metadata from the most recent authenticated frame ACK."""
+        return None
+
+    def on_pre_session_reset(
+        self, session_id: str, *, reference: Dict[str, Any], rewound: bool = False,
+    ) -> Dict[str, Any]:
+        """Opt-in prerequisite: retire the exact acknowledged frame before reset.
+
+        Providers verify credential ownership and the frozen reference CAS,
+        then return the acknowledged cleared frame metadata. No model calls.
+        Exceptions must propagate so the host preserves its transcript.
+        """
+        raise NotImplementedError("Memory provider does not support pre-session reset")
 
     @property
     @abstractmethod

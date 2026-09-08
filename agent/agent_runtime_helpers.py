@@ -2074,7 +2074,18 @@ def dump_api_request_debug(
     Captures the request body from api_kwargs (excluding transport-only keys
     like timeout). Intended for debugging provider-side 4xx failures where
     retries are not useful.
+
+    Private-lane refusal (DE_DESIGN §1.1 #10): a policy-stamped agent gets
+    no dump at all — no file, no stdout copy — because the dump carries the
+    full request body (system prompt, transcript, tool defs). Fail closed:
+    an accessor error refuses the dump.
     """
+    try:
+        _private = getattr(agent, "_private_execution_policy", None) is not None
+    except Exception:
+        _private = True
+    if _private:
+        return None
     try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)
@@ -3540,6 +3551,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """
     if not isinstance(function_args, dict):
         function_args = {}
+
+    # DE_DESIGN §5 graft: consult the private-policy accessor here too, so a
+    # caller passing the skip flags cannot bypass the funnel's tool gate.
+    try:
+        from agent.tool_executor import _private_execution_block_message
+
+        _private_block = _private_execution_block_message(agent, function_name)
+    except Exception:
+        _private_block = "Tool blocked: private execution policy state is unreadable"
+    if _private_block is not None:
+        return json.dumps({"error": _private_block}, ensure_ascii=False)
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:

@@ -5606,6 +5606,13 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        # Private-lane backstop (DE_DESIGN §1.1 #9): a context carrying a
+        # PrivateExecutionPolicy never dispatches plugin hooks — even when a
+        # finalizer-level gate was bypassed. The timeout worker below copies
+        # the caller's context, so without this fence the full hook payload
+        # would reach plugin code from private runs. Fail closed.
+        if _private_execution_context_bound():
+            return []
         # Most legacy observer hooks carry the shared telemetry marker. Gateway
         # platform events define event-local additive envelopes instead: injecting
         # a bus-wide version here would turn unrelated adapter payloads into one
@@ -6450,6 +6457,24 @@ def unload_plugins(
     return get_plugin_manager().unload(plugin)
 
 
+def _private_execution_context_bound() -> bool:
+    """True when the calling context carries a ``PrivateExecutionPolicy``.
+
+    Reads the ContextVar through ``sys.modules`` instead of importing the
+    gateway package: the ContextVar object lives in
+    ``gateway.private_execution_policy``, so if that module was never
+    imported no policy can be bound in this process and hooks proceed.
+    Once the module exists, any error reading it fails closed (private).
+    """
+    module = sys.modules.get("gateway.private_execution_policy")
+    if module is None:
+        return False
+    try:
+        return module.current_private_policy() is not None
+    except Exception:
+        return True
+
+
 def _delivery_manager() -> PluginManager:
     """Return the active manager, lazily running discovery if it never ran.
 
@@ -6479,7 +6504,13 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     callbacks registered by user plugins (tracking #64178).
 
     Returns a list of non-``None`` return values from plugin callbacks.
+
+    The private-lane backstop runs BEFORE ``_delivery_manager()`` so a
+    private run can never trigger first-invocation plugin discovery
+    (DE_DESIGN §1.1 #9).
     """
+    if _private_execution_context_bound():
+        return []
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 

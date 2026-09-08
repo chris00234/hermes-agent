@@ -176,6 +176,87 @@ from gateway.browser_control_broker import (
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
+from gateway.private_execution_policy import (
+    ALWAYS_EXCLUDED_TOOLSETS as _PRIVATE_ALWAYS_EXCLUDED_TOOLSETS,
+    PrivateExecutionPolicy,
+    bind_private_policy as _bind_private_policy,
+    current_private_policy as _current_private_policy,
+    reset_private_policy as _reset_private_policy,
+)
+
+# The private-execution grant header is honored ONLY on POST /v1/runs
+# (DE_DESIGN §1.1 #25); every other endpoint 400-rejects it.
+_PRIVATE_GRANT_HEADER = "X-Hermes-Private-Grant"
+
+_PRIVATE_ENGINE_GUARD_LOCK = threading.Lock()
+_private_engine_guard_installed = False
+
+
+def _ensure_private_context_engine_guard() -> None:
+    """Force the built-in context compressor for policy-bound constructions.
+
+    ``agent_init`` selects a plugin context engine purely from config
+    (``context.engine``, agent_init.py engine selection) — there is no
+    constructor kwarg. Wrap both loaders with ContextVar-aware guards so a
+    construction running under a bound private policy never builds (or
+    triggers discovery of) a plugin engine, while concurrent public
+    constructions delegate to the originals untouched (DE_DESIGN §1.1 #8).
+    """
+    global _private_engine_guard_installed
+    with _PRIVATE_ENGINE_GUARD_LOCK:
+        if _private_engine_guard_installed:
+            return
+        import plugins.context_engine as _ce_mod
+        from hermes_cli import plugins as _plugins_mod
+
+        _orig_load = _ce_mod.load_context_engine
+        _orig_get = _plugins_mod.get_plugin_context_engine
+
+        def _guarded_load_context_engine(name):
+            if _current_private_policy() is not None:
+                return None
+            return _orig_load(name)
+
+        def _guarded_get_plugin_context_engine():
+            if _current_private_policy() is not None:
+                return None
+            return _orig_get()
+
+        _ce_mod.load_context_engine = _guarded_load_context_engine
+        _plugins_mod.get_plugin_context_engine = _guarded_get_plugin_context_engine
+        _private_engine_guard_installed = True
+
+
+def _construct_private_agent(
+    agent_cls: Any,
+    agent_kwargs: Dict[str, Any],
+    policy: PrivateExecutionPolicy,
+) -> Any:
+    """Build a policy-fenced AIAgent (DE_DESIGN §4 bind points 5-6).
+
+    The ContextVar is bound around construction (belt-and-braces beside the
+    caller's bind) so construction-time code — including the context-engine
+    guard — observes the policy, then reset; post-construction flags follow
+    the background_review.py fork precedent. The stamped
+    ``_private_execution_policy`` attribute is the frozen policy object.
+    """
+    _ensure_private_context_engine_guard()
+    token = _bind_private_policy(policy)
+    try:
+        agent = agent_cls(**agent_kwargs)
+    finally:
+        try:
+            _reset_private_policy(token)
+        except Exception:
+            logger.warning("private policy ContextVar reset failed", exc_info=True)
+    agent._persist_disabled = True
+    agent._session_json_enabled = False
+    agent._end_session_on_close = False
+    # launchd captures gateway stdout: _vprint(force=True)/_emit_status lines
+    # bypass quiet_mode, so silence them like the background-review fork does.
+    agent.suppress_status_output = True
+    agent._private_execution_policy = policy
+    return agent
 
 
 def _get_scoped_secret(name, default=None):
@@ -1857,7 +1938,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "forwarded_for": self._clean_log_value(request.headers.get("X-Forwarded-For", "")),
             "real_ip": self._clean_log_value(request.headers.get("X-Real-IP", "")),
             "method": self._clean_log_value(request.method, max_len=16),
-            "path": self._clean_log_value(request.path_qs, max_len=500),
+            # Scrubbed: a query-delivered private grant must never reach
+            # the audit log — the 401 warning fires before any handler-level
+            # rejection can run (DE_DESIGN sink #24).
+            "path": self._clean_log_value(
+                _api_runs._scrub_private_grant_qs(request.path_qs), max_len=500
+            ),
             "user_agent": self._clean_log_value(request.headers.get("User-Agent", ""), max_len=300),
         }
 
@@ -2188,6 +2274,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             token = _api_request_profile.set(profile)
+            # Default-deny seed: no handler runs with an inherited/stale
+            # private policy; only /v1/runs admission mints one (DE_DESIGN
+            # §4 bind point 1). Authority is never finalized here (pre-auth).
+            private_seed_token = _bind_private_policy(None)
             try:
                 with self._profile_scope(profile):
                     resolved_profile = profile or "default"
@@ -2203,6 +2293,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
+                _reset_private_policy(private_seed_token)
                 _api_request_profile.reset(token)
 
         return profile_prefix_middleware
@@ -2935,6 +3026,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
+        private_execution_policy: Optional[PrivateExecutionPolicy] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3208,6 +3300,13 @@ class APIServerAdapter(BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        if private_execution_policy is not None:
+            # Clamp to the grant AND the platform's configured tools; the
+            # always-excluded set can never re-enter (DE_DESIGN §1.1 #4/#28).
+            enabled_toolsets = sorted(
+                (set(enabled_toolsets) & set(private_execution_policy.allowed_toolsets))
+                - _PRIVATE_ALWAYS_EXCLUDED_TOOLSETS
+            )
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -3231,10 +3330,13 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
+        private_run = private_execution_policy is not None
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
-            **_checkpoint_agent_kwargs(user_config),
+            # Private runs drop the checkpoint kwarg merge entirely
+            # (DE_DESIGN §1.1 #6).
+            **({} if private_run else _checkpoint_agent_kwargs(user_config)),
             "max_iterations": max_iterations,
             "quiet_mode": True,
             "verbose_logging": False,
@@ -3246,15 +3348,28 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            # Never open the profile state.db for a private run (#1).
+            "session_db": None if private_run else self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        if private_run:
+            agent_kwargs.update(
+                skip_memory=True,
+                skip_background_review=True,
+                save_trajectories=False,
+                checkpoints_enabled=False,
+            )
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
-        agent = AIAgent(**agent_kwargs)
+        if private_run:
+            agent = _construct_private_agent(
+                AIAgent, agent_kwargs, private_execution_policy
+            )
+        else:
+            agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3269,6 +3384,30 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
         }
         return agent
+
+    def _reject_stray_private_grant(
+        self, request: "web.Request"
+    ) -> Optional["web.Response"]:
+        """400-reject a private grant delivered off the /v1/runs lane.
+
+        No private policy can exist outside the runs lane (DE_DESIGN §4
+        bind point 3); honoring the header anywhere else would be sink #25.
+        A query-delivered grant is scanned case-insensitively too: the
+        MultiDict is case-sensitive and a silently-ignored grant would leak
+        into the path_qs audit log.
+        """
+        if (
+            _PRIVATE_GRANT_HEADER not in request.headers
+            and not _api_runs._query_carries_private_grant(request)
+        ):
+            return None
+        return web.json_response(
+            _openai_error(
+                f"{_PRIVATE_GRANT_HEADER} is honored only on POST /v1/runs",
+                code="private_grant_not_allowed",
+            ),
+            status=400,
+        )
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -4719,6 +4858,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -4836,6 +4978,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
@@ -5166,6 +5311,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -6346,6 +6494,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -6940,6 +7091,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -6994,6 +7148,9 @@ class APIServerAdapter(BasePlatformAdapter):
         trips NAS's HTTP timeout. The store CAS claim inside fire_due guards
         against double-fire on a NAS/scheduler retry.
         """
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         from hermes_cli.config import cfg_get, load_config
         from plugins.cron_providers.chronos.verify import get_fire_verifier
 

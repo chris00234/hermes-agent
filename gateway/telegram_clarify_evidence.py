@@ -30,8 +30,11 @@ def _route(bot, message):
     )
 
 
-def delivered(adapter, clarify_id, message, question, choices, rendered_text):
+def delivered(
+    adapter, clarify_id, message, question, choices, rendered_text, reply_markup=None
+):
     from tools import clarify_gateway as cm
+    from gateway.telegram_clarify_callbacks import delivered_keyboard
 
     route = _route(adapter._bot, message)
     author = getattr(message, "from_user", None)
@@ -45,18 +48,18 @@ def delivered(adapter, clarify_id, message, question, choices, rendered_text):
         entry = cm._entries.get(clarify_id)
         if entry and entry.evidence and not entry.event.is_set():
             entry.evidence.delivered(
-                question=question, options=choices, rendered_text=rendered_text, **route
+                question=question,
+                options=choices,
+                rendered_text=rendered_text,
+                **route,
+                **delivered_keyboard(message, reply_markup, clarify_id, choices),
             )
 
 
-def _original(message, update):
-    user = getattr(message, "from_user", None)
+def _unmodified(message):
     legacy = getattr(message, "api_kwargs", {})
     return (
-        getattr(user, "is_bot", None) is False
-        and getattr(update, "message", None) is message
-        and getattr(update, "edited_message", None) is None
-        and getattr(message, "is_automatic_forward", None) is not True
+        getattr(message, "is_automatic_forward", None) is not True
         and all(
             getattr(message, key, None) is None
             for key in (
@@ -76,6 +79,15 @@ def _original(message, update):
                 "forward_sender_name",
             )
         )
+    )
+
+
+def _original(message, update):
+    return (
+        getattr(getattr(message, "from_user", None), "is_bot", None) is False
+        and getattr(update, "message", None) is message
+        and getattr(update, "edited_message", None) is None
+        and _unmodified(message)
     )
 
 
@@ -145,7 +157,17 @@ def authorize_candidate(event, source):
 
     data = dict(event["payload"])
     clarify_id = data.pop("clarify_id")
-    if str(source.user_id) != data["user_id"] or str(source.chat_id) != data["chat_id"]:
+    if (
+        str(source.user_id) != data["user_id"]
+        or str(source.chat_id) != data["chat_id"]
+        # The auth source omits thread_id for non-forum supergroup reply
+        # threads while _route keeps the raw message_thread_id, so the sides
+        # can legitimately disagree as None vs set for the same authorized
+        # message. Compare only when the auth source carries a thread;
+        # matches_transport still pins data["thread_id"] to the delivery.
+        or (source.thread_id is not None and source.thread_id != data["thread_id"])
+        or getattr(source.platform, "value", source.platform) != "telegram"
+    ):
         return None
     with cm._lock:
         entry = cm._entries.get(clarify_id)
@@ -159,6 +181,10 @@ def authorize_candidate(event, source):
                 if entry.evidence.matches_transport(data):
                     entry.evidence.close("edited")
                 return None
+            if event["event_type"] == "clarify_callback_candidate":
+                return entry.evidence.original_callback(
+                    data, event["callback_snapshot"]
+                )
             return entry.evidence.original_reply(data)
     return None
 

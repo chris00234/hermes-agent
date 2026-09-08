@@ -14,11 +14,25 @@ import logging
 import os
 import json
 import threading
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
+
+from agent.memory_provider import sanitize_working_frame_reference
+
+
+def _working_frame_scope_or_none(data: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
+    """Sanitize a persisted scope; an invalid one must never drop the entry."""
+    try:
+        return sanitize_working_frame_reference(data.get(key))
+    except Exception as exc:
+        logger.warning(
+            "Dropping invalid %s on session entry load: %s", key, type(exc).__name__
+        )
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -805,6 +819,8 @@ class SessionEntry:
     # (e.g. Slack thread-context watermarks). Survives gateway restarts via
     # the routing index; must stay small and JSON-serializable.
     metadata: Dict[str, Any] = field(default_factory=dict)
+    working_frame_scope: Optional[Dict[str, Any]] = None
+    working_frame_pending_scope: Optional[Dict[str, Any]] = None
     
     # Token tracking
     input_tokens: int = 0
@@ -922,6 +938,10 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        for key in ("working_frame_scope", "working_frame_pending_scope"):
+            reference = sanitize_working_frame_reference(getattr(self, key))
+            if reference is not None:
+                result[key] = reference
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -990,6 +1010,8 @@ class SessionEntry:
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
             metadata=dict(data.get("metadata") or {}),
+            working_frame_scope=_working_frame_scope_or_none(data, "working_frame_scope"),
+            working_frame_pending_scope=_working_frame_scope_or_none(data, "working_frame_pending_scope"),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             cache_read_tokens=data.get("cache_read_tokens", 0),
@@ -3304,6 +3326,128 @@ class SessionStore:
                 return default
             return entry.metadata.get(key, default)
 
+    def get_working_frame_scope(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Return acknowledged metadata matching the current route, if known."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            for reference in (entry.working_frame_scope, entry.working_frame_pending_scope):
+                clean = sanitize_working_frame_reference(reference)
+                if (clean is not None and clean["session_id"] == entry.session_id
+                        and clean["expires_at"] > time.time()):
+                    return clean
+            return None
+
+    @staticmethod
+    def _scope_ack_advances(previous: Dict[str, Any], reference: Dict[str, Any]) -> bool:
+        if any(previous[key] != reference[key] for key in
+               ("provider", "principal", "agent", "project", "session_id")):
+            return False
+        return (reference["revision"] > previous["revision"]
+                or reference == previous)
+
+    @staticmethod
+    def _scope_new_lifetime(current: Dict[str, Any], reference: Dict[str, Any]) -> bool:
+        """A different logical lifetime may restart its revision when the
+        recorded scope expired or the incoming reference is a cleared ACK;
+        within the same logical lifetime revision regress stays rejected."""
+        return (
+            reference["logical_task_id"] != current["logical_task_id"]
+            and (reference["cleared"] or current["expires_at"] <= time.time())
+        )
+
+    @staticmethod
+    def _scope_ack_continues(source: Dict[str, Any], reference: Dict[str, Any]) -> bool:
+        return (
+            reference.get("source_session_id") == source["session_id"]
+            and reference.get("source_revision") == source["revision"]
+            and reference["session_id"] != source["session_id"]
+            and all(reference.get(key) == source.get(key) for key in
+                    ("provider", "principal", "agent", "project", "logical_task_id",
+                     "lifecycle_epoch", "cleared"))
+        )
+
+    def _merge_scope_reference(self, entry: "SessionEntry", expected_session_id: str,
+                               clean: Dict[str, Any]):
+        """CAS-merge a sanitized reference into (current, pending), or None."""
+        current = sanitize_working_frame_reference(entry.working_frame_scope)
+        pending = sanitize_working_frame_reference(entry.working_frame_pending_scope)
+        if pending and pending["session_id"] == expected_session_id:
+            current, pending = pending, None
+        if clean["session_id"] == expected_session_id:
+            if current and current["session_id"] == expected_session_id:
+                if (not self._scope_new_lifetime(current, clean)
+                        and not self._scope_ack_advances(current, clean)):
+                    return None
+                if clean["cleared"] or clean["logical_task_id"] != current["logical_task_id"]:
+                    pending = None
+            return clean, pending
+        if pending and clean["session_id"] == pending["session_id"]:
+            return (current, clean) if self._scope_ack_advances(pending, clean) else None
+        if any(self._scope_ack_continues(source, clean) for source in
+               (pending, current) if source is not None):
+            return current, clean
+        return None
+
+    def record_working_frame_scope(
+        self, session_key: str, expected_session_id: str, reference: Dict[str, Any],
+        *, active_profile: Optional[str] = None,
+    ) -> bool:
+        """Persist a current ACK or proven compression continuation with route CAS.
+
+        ``active_profile`` is the runner's serving profile — the agent fence
+        for non-multiplexed gateways, where ``origin.profile`` and the
+        session-key namespace carry no profile.
+        """
+        clean = sanitize_working_frame_reference(reference)
+        if clean is None:
+            raise ValueError("Missing working frame reference")
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            profile = entry.origin.profile if entry.origin else None
+            profile = profile or self._named_profile_for_key(session_key) or active_profile
+            if profile and clean["agent"] != profile:
+                return False
+            merged = self._merge_scope_reference(entry, expected_session_id, clean)
+            if merged is None:
+                return False
+            current, pending = merged
+            candidate = entry.to_dict()
+            candidate["working_frame_scope"] = current
+            candidate["working_frame_pending_scope"] = pending
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            entry.working_frame_scope = current
+            entry.working_frame_pending_scope = pending
+            return True
+
+    def expire_working_frame_scope(
+        self, session_key: str, expected_session_id: str
+    ) -> bool:
+        """Drop the durable scope after an explicit unrecoverable determination.
+
+        Only for a scope whose provider can never be loaded under the current
+        configuration (provider switched or memory disabled): retirement can
+        never succeed, so keeping the scope would block /reset //undo until
+        it expires (up to 7 days). Route CAS mirrors record_working_frame_scope.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            candidate = entry.to_dict()
+            candidate["working_frame_scope"] = None
+            candidate["working_frame_pending_scope"] = None
+            self._save_entry(session_key, entry_data=candidate, lock_held=True)
+            entry.working_frame_scope = None
+            entry.working_frame_pending_scope = None
+            return True
+
     def set_session_metadata(
         self,
         session_key: str,
@@ -4435,6 +4579,34 @@ class SessionStore:
                 exc_info=True,
             )
             raise TranscriptReadError(session_id) from e
+
+    def has_rewindable_user_turn(self, session_id: str) -> bool:
+        """Dry-run probe for /undo: True iff ``rewind_session`` has a target.
+
+        Uses the same durable-transcript view and turn classifier as
+        ``rewind_session`` so /undo can retire the working-frame scope only
+        when a rewind will actually happen — a no-op /undo must not clear
+        the frame (contract B).
+        """
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return False
+        from agent.context_compressor import (
+            split_user_originated_turn,
+            user_originated_turn_view,
+        )
+
+        try:
+            durable = db.get_messages_as_conversation(session_id, include_row_ids=True)
+            return any(
+                user_originated_turn_view(m) is not None
+                and isinstance(m.get("_row_id"), int)
+                and split_user_originated_turn(m)[1] is not None
+                for m in durable
+            )
+        except Exception as e:
+            logger.debug("has_rewindable_user_turn: %s", e)
+            return False
 
     def rewind_session(
         self,

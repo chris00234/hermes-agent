@@ -61,6 +61,11 @@ HISTORY_UNREADABLE = (
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
+# Upper bound on the durable working-frame retirement that must precede a
+# /reset or /undo (contract B). Past this the command is BLOCKED (fail
+# closed), never run with an unretired frame.
+_WORKING_FRAME_RETIRE_TIMEOUT_S = 10.0
+
 
 def _clean_str(value: Any) -> str:
     """Strip and return a non-empty string value, or empty string."""
@@ -147,12 +152,67 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _retire_working_frame_scope(
+        self, session_key: str, *, rewound: bool,
+    ) -> Union[None, bool, dict]:
+        """Retire the durable acknowledged working-frame scope, if any.
+
+        Returns the cleared ACK dict on success, None when no durable scope
+        is recorded (legacy behavior applies), and False when retirement
+        failed or timed out — the caller must then block the reset/rewind.
+        """
+        getter = getattr(self.session_store, "get_working_frame_scope", None)
+        if not callable(getter):
+            return None
+        scope = await self.async_session_store.get_working_frame_scope(session_key)
+        if not isinstance(scope, dict):
+            return None
+        from gateway.working_frame_scope import (
+            OrphanedWorkingFrameScopeError,
+            retire_working_frame_scope_sync,
+        )
+        # Absolute deadline shared with the worker thread: retirement work
+        # that starts (or is still queued) past the fail-closed reply below
+        # must never run to completion and clear the frame afterwards.
+        deadline = time.monotonic() + _WORKING_FRAME_RETIRE_TIMEOUT_S
+        try:
+            return await asyncio.wait_for(
+                self._run_in_executor_with_context(
+                    retire_working_frame_scope_sync,
+                    self, session_key, scope, rewound, deadline,
+                ),
+                timeout=_WORKING_FRAME_RETIRE_TIMEOUT_S,
+            )
+        except OrphanedWorkingFrameScopeError as exc:
+            # Unrecoverable by retrying: the scope's provider can never be
+            # loaded again under the current configuration. Drop the orphan
+            # so legacy behavior applies instead of blocking for days.
+            logger.warning(
+                "Dropping unretirable working frame scope for %s: %s",
+                session_key, exc,
+            )
+            await self.async_session_store.expire_working_frame_scope(
+                session_key, scope["session_id"],
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Working frame scope retirement (%s) failed for %s: %s",
+                "rewind" if rewound else "reset", session_key, type(exc).__name__,
+            )
+            return False
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
-        
+
         # Get existing session key
         session_key = self._session_key_for_source(source)
+        # Contract B prerequisite: retire the durable acknowledged
+        # working-frame scope BEFORE any invalidation/cleanup/rotation.
+        # A recorded scope that cannot be retired blocks the reset.
+        if await self._retire_working_frame_scope(session_key, rewound=False) is False:
+            return t("gateway.reset.memory_scope_failed")
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -3276,9 +3336,38 @@ class GatewaySlashCommandsMixin:
                 n = 1
 
         session_entry = await self.async_session_store.get_or_create_session(source)
+        # Contract B prerequisite: retire the durable acknowledged
+        # working-frame scope BEFORE the rewind; failure blocks the undo.
+        # Probe first — a no-op /undo must not clear the frame — so the
+        # retirement only runs when a rewind will actually happen.
+        _undo_key = self._session_key_for_source(source)
+        _scope_getter = getattr(self.session_store, "get_working_frame_scope", None)
+        _undo_scope = (
+            await self.async_session_store.get_working_frame_scope(_undo_key)
+            if callable(_scope_getter) else None
+        )
+        _frame_ack = None
+        if isinstance(_undo_scope, dict):
+            if not await self.async_session_store.has_rewindable_user_turn(
+                session_entry.session_id
+            ):
+                return t("gateway.undo.nothing")
+            _frame_ack = await self._retire_working_frame_scope(_undo_key, rewound=True)
+            if _frame_ack is False:
+                return t("gateway.undo.memory_scope_failed")
         result = await self.async_session_store.rewind_session(session_entry.session_id, n)
 
         if result is None:
+            if isinstance(_frame_ack, dict):
+                # The durable frame was already retired server-side, but the
+                # rewind then found no turn (concurrent turn, DB error,
+                # classifier mismatch). "Nothing to undo." would hide that
+                # the memory checkpoint state changed.
+                logger.warning(
+                    "undo: working frame retired but rewind removed no turn "
+                    "for %s", _undo_key,
+                )
+                return t("gateway.undo.frame_reset_without_rewind")
             return t("gateway.undo.nothing")
 
         # Reset stored token count — transcript was truncated.

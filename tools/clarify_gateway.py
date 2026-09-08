@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from tools.clarify_evidence import ClarifyEvidence, OriginalReply
+    from tools.clarify_evidence import ClarifyEvidence, OriginalCallback, OriginalReply
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +172,7 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 
 def resolve_gateway_clarify(
     clarify_id: str, response: str, *, selected_reply: Optional[OriginalReply] = None,
+    selected_callback: Optional[OriginalCallback] = None,
 ) -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
 
@@ -184,7 +185,11 @@ def resolve_gateway_clarify(
             return False
         entry.response = str(response) if response is not None else ""
         if entry.evidence:
-            entry.evidence.close("resolved" if entry.response else "cancelled", selected_reply)
+            selected = selected_reply
+            if selected_callback is not None:
+                selected = (selected_callback if selected_reply is None
+                            and selected_callback.matches(entry.response) else None)
+            entry.evidence.close("resolved" if entry.response else "cancelled", selected)
         entry.event.set()
         return True
 

@@ -319,6 +319,43 @@ class TestSetupVerboseLogging:
         assert verbose_handlers[0].level == logging.DEBUG
 
 
+    def test_verbose_stream_handler_drops_private_records(self, hermes_home):
+        """launchd captures stderr into gateway.error.log — the verbose
+        StreamHandler must carry the private-record drop like every other
+        handler this module installs."""
+        import gateway.private_execution_policy as pep
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.setup_verbose_logging()
+
+        root = logging.getLogger()
+        handler = next(
+            h for h in root.handlers
+            if getattr(h, "_hermes_verbose", False)
+        )
+        stream = io.StringIO()
+        handler.setStream(stream)
+
+        policy = pep.build_policy(
+            run_id="run-1",
+            profile="design",
+            execution_attempt_id="att-1",
+            lease_expires_at="2027-01-01T00:00:00+00:00",
+            allowed_toolsets=("alpha",),
+        )
+        test_logger = logging.getLogger("_test_verbose_private")
+        token = pep.bind_private_policy(policy)
+        try:
+            test_logger.debug("PRIVATE-VERBOSE-MARKER-3141")
+        finally:
+            pep.reset_private_policy(token)
+        test_logger.debug("PUBLIC-VERBOSE-MARKER-2718")
+
+        output = stream.getvalue()
+        assert "PRIVATE-VERBOSE-MARKER-3141" not in output
+        assert "PUBLIC-VERBOSE-MARKER-2718" in output
+
+
 
 class TestAddRotatingHandler:
     """_add_rotating_handler() is idempotent and creates the directory."""
@@ -366,8 +403,11 @@ class TestAddRotatingHandler:
 
         handlers = [h for h in hermes_logging.rotating_file_handlers() if isinstance(h, RotatingFileHandler)]
         assert len(handlers) == 1
-        # No _SessionFilter on the handler — record factory handles it
-        assert len(handlers[0].filters) == 0
+        # No _SessionFilter on the handler — record factory handles it.
+        # The only handler filter is the private-lane record drop.
+        assert [type(f) for f in handlers[0].filters] == [
+            hermes_logging._PrivateRecordFilter
+        ]
 
         # But session_tag still works (via record factory)
         hermes_logging.set_session_context("factory_test")

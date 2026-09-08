@@ -33,7 +33,10 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
+from agent.memory_provider import (
+    MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, PRE_SESSION_RESET_API_VERSION,
+    sanitize_working_frame_reference,
+)
 from agent.memory_lifecycle import MemoryLifecycle
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
@@ -80,6 +83,10 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# Deadline for the /reset //undo working-frame retirement (an HTTP round-trip
+# behind queued FIFO writes). Longer than the default lifecycle wait, and
+# fail-closed: on timeout the queued retirement is abandoned, never run late.
+_PRE_SESSION_RESET_TIMEOUT_S = 9.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -462,6 +469,7 @@ class MemoryManager:
         # a bounded FIFO drain, then explicitly report anything abandoned.
         self._background_futures: Dict[Future, str] = {}
         self._memory_lifecycle = MemoryLifecycle(self._submit_background)
+        self._working_frame_scope_sink: Optional[Callable[[Dict[str, Any]], Any]] = None
         self._shutting_down = False
         self._shutdown_drain_state: Dict[str, Any] = {
             "status": "not_started",
@@ -471,6 +479,24 @@ class MemoryManager:
         }
 
     # -- Registration --------------------------------------------------------
+
+    def set_working_frame_scope_sink(self, sink: Callable[[Dict[str, Any]], Any]) -> None:
+        """Bind the host's durable metadata writer before dispatching turns."""
+        if not callable(sink):
+            raise TypeError("Working frame scope sink must be callable")
+        self._working_frame_scope_sink = sink
+
+    def _record_working_frame_scope(self, provider: MemoryProvider) -> None:
+        if self._working_frame_scope_sink is None:
+            return
+        getter = getattr(provider, "working_frame_reference", None)
+        reference = sanitize_working_frame_reference(getter()) if callable(getter) else None
+        if reference is None:
+            return
+        if reference["provider"] != provider.name:
+            raise ValueError("Working frame reference provider mismatch")
+        if self._working_frame_scope_sink(reference) is False:
+            raise RuntimeError("Working frame scope was not durably acknowledged")
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a memory provider.
@@ -809,6 +835,7 @@ class MemoryManager:
                             assistant_content,
                             session_id=session_id,
                         )
+                    self._record_working_frame_scope(provider)
                 except Exception as e:
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
@@ -996,6 +1023,55 @@ class MemoryManager:
 
     # -- Lifecycle hooks -----------------------------------------------------
 
+    def supports_pre_session_reset(self) -> bool:
+        return any(
+            type(getattr(provider, "pre_session_reset_api_version", None)) is int
+            and provider.pre_session_reset_api_version >= PRE_SESSION_RESET_API_VERSION
+            for provider in self._providers
+        )
+
+    def on_pre_session_reset(
+        self, session_id: str, *, reference: Dict[str, Any], rewound: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Wait for FIFO provider retirement and durable scope persistence.
+
+        ``timeout`` caps (never extends) the fixed retirement deadline so the
+        abandonment fence engages no later than the caller's own fail-closed
+        deadline; ``timeout <= 0`` abandons the queued retirement immediately.
+        """
+        frozen = sanitize_working_frame_reference(reference)
+        if frozen is None or frozen["session_id"] != session_id:
+            raise ValueError("Pre-session reset reference session mismatch")
+        provider = self.get_provider(frozen["provider"])
+        version = getattr(provider, "pre_session_reset_api_version", None)
+        if type(version) is not int or version < PRE_SESSION_RESET_API_VERSION:
+            raise RuntimeError("No active memory provider supports pre-session reset")
+
+        def _run() -> Dict[str, Any]:
+            acknowledged = sanitize_working_frame_reference(provider.on_pre_session_reset(
+                session_id, reference=dict(frozen), rewound=rewound,
+            ))
+            if acknowledged is None or not acknowledged["cleared"]:
+                raise RuntimeError("Pre-session reset did not acknowledge a cleared frame")
+            if any(acknowledged[key] != frozen[key] for key in
+                   ("provider", "principal", "agent", "project", "session_id")):
+                raise RuntimeError("Pre-session reset acknowledgement scope mismatch")
+            replayed = frozen["cleared"] and acknowledged == frozen
+            if not replayed and acknowledged["revision"] <= frozen["revision"]:
+                raise RuntimeError("Pre-session reset acknowledgement revision did not advance")
+            if self._working_frame_scope_sink is not None:
+                if self._working_frame_scope_sink(acknowledged) is False:
+                    raise RuntimeError("Working frame scope was not durably acknowledged")
+            return acknowledged
+
+        wait = _PRE_SESSION_RESET_TIMEOUT_S
+        if timeout is not None:
+            wait = max(0.0, min(wait, timeout))
+        return self._memory_lifecycle.call(
+            _run, transition=True, required=True, timeout=wait,
+        )
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Notify all providers of a new turn.
 
@@ -1131,6 +1207,7 @@ class MemoryManager:
                     reset=reset,
                     **kwargs,
                 )
+                self._record_working_frame_scope(provider)
             except Exception as e:
                 failed = True
                 logger.debug(
@@ -1230,6 +1307,7 @@ class MemoryManager:
                     # also land here instead of dying on an unexpected
                     # kwarg — they simply never see the requirement signal.
                     result = provider.on_pre_compress(provider_messages)
+                self._record_working_frame_scope(provider)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -1400,7 +1478,7 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def shutdown_all(self) -> None:
+    def shutdown_all(self, *, drain: bool = True) -> None:
         """Shut down all providers (reverse order for clean teardown).
 
         Drains the background sync/prefetch executor first (bounded by
@@ -1408,8 +1486,21 @@ class MemoryManager:
         land before providers are torn down. The worker threads are
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
+
+        ``drain=False`` marks the manager shutting down WITHOUT waiting
+        out the drain window — used by the bare /reset //undo retirement
+        path when the retirement already timed out and its worker is known
+        to be wedged (waiting again buys nothing and blocks the caller).
         """
-        self._drain_sync_executor()
+        if drain:
+            self._drain_sync_executor()
+        else:
+            with self._sync_executor_lock:
+                self._shutting_down = True
+                executor = self._sync_executor
+                self._sync_executor = None
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
         for provider in reversed(self._providers):
             try:
                 provider.shutdown()

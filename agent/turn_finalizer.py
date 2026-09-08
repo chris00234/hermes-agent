@@ -613,11 +613,22 @@ def finalize_turn(
     _response_transformed = False
     _pre_transform_response = None
 
+    # Private-lane fence (DE_DESIGN §1.1 #8-#9): a policy-stamped agent never
+    # dispatches lifecycle hooks or context-engine observation — their
+    # payloads carry the full transcript out of the fenced run. Fail closed:
+    # an accessor error is treated as private.
+    try:
+        _private_run = (
+            getattr(agent, "_private_execution_policy", None) is not None
+        )
+    except Exception:
+        _private_run = True
+
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _private_run:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -640,7 +651,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _private_run:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -660,30 +671,35 @@ def finalize_turn(
     # Context engine observation hook: notify the active engine that this
     # turn has finished, with the finalized transcript. Complements the
     # per-request select_context() hook (selection before the request;
-    # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    # observation after the turn). No-op default, fail-open — but never
+    # dispatched for a private run (DE_DESIGN §1.1 #8).
+    if not _private_run:
+        try:
+            from agent.conversation_loop import (
+                _notify_context_engine_turn_complete,
+            )
+            # Forward the turn's canonical usage when the host has it. The
+            # loop stashes the most recent API response's usage dict (the
+            # same canonical buckets fed to ``update_from_response``) on the
+            # agent as ``_last_turn_usage``. It is ``None`` on turns that
+            # never reached a provider response (early failure / interrupt),
+            # which is exactly the contract: real usage when available,
+            # ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -839,22 +855,24 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    # Suppressed for private runs (DE_DESIGN §1.1 #9).
+    if not _private_run:
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

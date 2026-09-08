@@ -254,6 +254,7 @@ gateway:
     title_error_untitled:  "\n⚠️ {error} — sessione avviata senza titolo."
     title_empty_untitled:  "\n⚠️ Il titolo è vuoto dopo la pulizia — sessione avviata senza titolo."
     tip:                   "\n✦ Suggerimento: {tip}"
+    memory_scope_failed:   "Impossibile ritirare il checkpoint di memoria; la sessione è rimasta invariata. Riprova tra un momento."
 
   restart:
     in_progress:           "⏳ Riavvio del gateway già in corso..."
@@ -380,6 +381,8 @@ Future messages in this room will use that transcript until `/reset` or another 
     nothing:               "Niente da annullare."
     removed:               "↩️ Annullati {turns} turno/i ({count} messaggio/i).\nSalvato in: \"{preview}\"\nCopia/modifica il testo qui sopra e invialo per ripartire da qui."
     invalid_count:         "Conteggio non valido \"{arg}\" — usa /undo o /undo N."
+    memory_scope_failed:   "Impossibile ritirare il checkpoint di memoria; la sessione è rimasta invariata. Riprova tra un momento."
+    frame_reset_without_rewind: "Il checkpoint di memoria è stato azzerato, ma non è stato possibile rimuovere alcun turno di conversazione — la trascrizione è invariata."
 
   update:
     platform_not_messaging:  "✗ /update è disponibile solo dalle piattaforme di messaggistica. Esegui `hermes update` dal terminale."

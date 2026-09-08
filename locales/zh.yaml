@@ -254,6 +254,7 @@ gateway:
     title_error_untitled:  "\n⚠️ {error} — 会话以未命名方式启动。"
     title_empty_untitled:  "\n⚠️ 清理后标题为空 — 会话以未命名方式启动。"
     tip:                   "\n✦ 提示：{tip}"
+    memory_scope_failed:   "无法结束记忆检查点；会话未变更。请稍后再试。"
 
   restart:
     in_progress:           "⏳ 网关重启已在进行中……"
@@ -380,6 +381,8 @@ Future messages in this room will use that transcript until `/reset` or another 
     nothing:               "没有可撤销的内容。"
     removed:               "↩️ 已撤销 {turns} 个回合（{count} 条消息）。\n已备份到：「{preview}」\n复制/编辑上面的文本并发送，即可从此处重新提问。"
     invalid_count:         "无效的数量「{arg}」—— 请使用 /undo 或 /undo N。"
+    memory_scope_failed:   "无法结束记忆检查点；会话未变更。请稍后再试。"
+    frame_reset_without_rewind: "记忆检查点已重置，但无法移除任何对话回合 —— 逐字稿未变更。"
 
   update:
     platform_not_messaging:  "✗ /update 仅在消息平台可用。请在终端运行 `hermes update`。"

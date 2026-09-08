@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote_plus
 
 try:
     from aiohttp import web
@@ -17,8 +18,36 @@ except ImportError:
     web = None  # type: ignore[assignment]
     RequestKey = None  # type: ignore[assignment,misc]
 
+from gateway.private_execution_policy import (
+    GrantError,
+    bind_private_policy,
+    build_policy,
+    reset_private_policy,
+    resolve_private_grant_secret,
+    verify_grant,
+)
 
 logger = logging.getLogger("gateway.platforms.api_server")
+
+_PRIVATE_GRANT_HEADER = "X-Hermes-Private-Grant"
+# Durable status_json whitelist for private runs (DE_DESIGN §1.1 #11).
+# ``private`` is the durable privacy marker restart hydration re-derives
+# ``_private_run_ids`` membership from.
+_PRIVATE_STATUS_KEYS = (
+    "run_id",
+    "status",
+    "created_at",
+    "updated_at",
+    "usage",
+    "error_class",
+    "output_digest",
+    "output_ref",
+    "private",
+)
+# Lifecycle-only SSE fields for private runs (DE_DESIGN §1.1 #13).
+_PRIVATE_EVENT_KEYS = frozenset(
+    {"event", "run_id", "timestamp", "tool", "duration", "error"}
+)
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float)
     if RequestKey is not None
@@ -45,6 +74,217 @@ def _room_retention_until(request: "web.Request") -> float:
 def _uses_room_run_auth(self, request: "web.Request") -> bool:
     return request.path.endswith("/v1/runs") and bool(
         self._room_grant_token(request)
+    )
+
+
+def _query_carries_private_grant(request: "web.Request") -> bool:
+    """Case-insensitive scan for a query-delivered grant (fail closed).
+
+    ``request.query`` is a case-sensitive MultiDict, so an exact-casing
+    check misses mixed-case smuggling — the grant would be silently ignored
+    and the run would proceed PUBLIC while the audit log records path_qs.
+    """
+    try:
+        keys = request.query.keys()
+    except Exception:
+        return True
+    target = _PRIVATE_GRANT_HEADER.lower()
+    return any(str(key).lower() == target for key in keys)
+
+
+def _reject_query_grant(self, request: "web.Request", *, _api_server):
+    """400-reject a query-delivered grant on any runs-lane endpoint.
+
+    ``path_qs`` lands in durable audit/access logs, so a grant in the
+    query string is a leaked replayable bearer credential — reject loudly
+    instead of silently ignoring it (DE_DESIGN sink #24).
+    """
+    if not _query_carries_private_grant(request):
+        return None
+    return web.json_response(
+        _api_server._openai_error(
+            "Private execution grants are accepted only as a header.",
+            code="invalid_private_grant",
+        ),
+        status=400,
+    )
+
+
+def _scrub_private_grant_qs(path_qs: str) -> str:
+    """Redact a query-delivered grant value from an audit-log path string.
+
+    The 401 audit line fires before any handler-level 400 rejection can
+    run, so ``path_qs`` must never carry a live grant (DE_DESIGN sink #24).
+    """
+    try:
+        path, sep, query = str(path_qs).partition("?")
+        if not sep:
+            return path
+        target = _PRIVATE_GRANT_HEADER.lower()
+        pairs = []
+        for pair in query.split("&"):
+            key = pair.split("=", 1)[0]
+            if unquote_plus(key).strip().lower() == target:
+                pairs.append(f"{key}=REDACTED")
+            else:
+                pairs.append(pair)
+        return f"{path}?{'&'.join(pairs)}"
+    except Exception:
+        # Fail closed: an unparsable query never reaches the audit log.
+        return "[scrub-failed]"
+
+
+def _grant_serving_profile(*, _api_server) -> Optional[str]:
+    """The profile identity the grant HMAC must bind to, else None.
+
+    The URL-prefix ContextVar is None on single-profile gateways, so using
+    it would collapse the profile leg of the HMAC to "default" and a grant
+    minted for another gateway's profile would verify here. Derive the
+    identity from the gateway's own serving profile (the same HERMES_HOME
+    source the profile-scoped secret resolution uses); None means unknown
+    and the caller must fail closed.
+    """
+    profile = _api_server._api_request_profile.get()
+    if profile:
+        return profile
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or None
+    except Exception:
+        return None
+
+
+def _private_grant_attempt_id(
+    self, request: "web.Request", *, _api_server
+) -> Optional[str]:
+    """Verified private-grant attempt id from the header, else None."""
+    try:
+        header = request.headers.get(_PRIVATE_GRANT_HEADER)
+    except Exception:
+        return None
+    if not header:
+        return None
+    profile = _grant_serving_profile(_api_server=_api_server)
+    if profile is None:
+        return None
+    secret = resolve_private_grant_secret(profile)
+    try:
+        attempt_id, _expiry = verify_grant(
+            header, secret, profile=profile, now=time.time()
+        )
+    except GrantError:
+        return None
+    return attempt_id
+
+
+def _verify_private_grant_admission(self, request: "web.Request", *, _api_server):
+    """Verify the grant on POST /v1/runs; return (attempt_id, expiry, error)."""
+    _openai_error = _api_server._openai_error
+
+    def _denied(message: str) -> "web.Response":
+        return web.json_response(
+            _openai_error(message, code="invalid_private_grant"), status=403
+        )
+
+    query_err = _reject_query_grant(self, request, _api_server=_api_server)
+    if query_err is not None:
+        return None, 0, query_err
+    header = request.headers.get(_PRIVATE_GRANT_HEADER)
+    if header is None:
+        return None, 0, None
+    if self._room_grant_token(request):
+        # A room-token caller must never mint a private policy: the private
+        # idempotency scope is grant-derived, not room-derived.
+        return None, 0, _denied(
+            "Private execution grants cannot ride room authority."
+        )
+    profile = _grant_serving_profile(_api_server=_api_server)
+    if profile is None:
+        return None, 0, _denied(
+            "Gateway profile identity is unavailable."
+        )
+    secret = resolve_private_grant_secret(profile)
+    try:
+        attempt_id, expiry = verify_grant(
+            header, secret, profile=profile, now=time.time()
+        )
+    except GrantError as exc:
+        return None, 0, _denied(str(exc))
+    return attempt_id, expiry, None
+
+
+def _reject_private_linkage(body, gateway_session_key, *, _openai_error):
+    """400-reject session/memory reconnection vectors on the private lane."""
+    rejected = None
+    if gateway_session_key:
+        rejected = "X-Hermes-Session-Key"
+    elif body.get("session_id"):
+        rejected = "session_id"
+    elif body.get("conversation_history"):
+        rejected = "conversation_history"
+    elif body.get("previous_response_id"):
+        rejected = "previous_response_id"
+    if rejected is None:
+        return None
+    return web.json_response(
+        _openai_error(
+            f"Private runs reject {rejected}.",
+            code="private_run_linkage_rejected",
+        ),
+        status=400,
+    )
+
+
+def _mint_private_policy(body, *, run_id, attempt_id, expiry, profile):
+    """Derive the immutable policy server-side from the verified grant."""
+    from datetime import datetime, timezone
+
+    raw_toolsets = body.get("allowed_toolsets") or []
+    allowed = [item for item in raw_toolsets if isinstance(item, str)]
+    lease = datetime.fromtimestamp(int(expiry), tz=timezone.utc).isoformat()
+    return build_policy(
+        run_id=run_id,
+        profile=profile,
+        execution_attempt_id=attempt_id,
+        lease_expires_at=lease,
+        allowed_toolsets=allowed,
+    )
+
+
+def _project_private_run_status(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Metadata-only durable projection for private runs (fail closed)."""
+    output = status.get("output")
+    digest = (
+        hashlib.sha256(output.encode()).hexdigest()
+        if isinstance(output, str) and output
+        else ""
+    )
+    run_id = str(status.get("run_id") or "")
+    return {
+        "run_id": run_id,
+        "status": status.get("status"),
+        "created_at": status.get("created_at"),
+        "updated_at": status.get("updated_at"),
+        "usage": status.get("usage") or {},
+        "error_class": status.get("error_class") or "",
+        "output_digest": digest,
+        "output_ref": f"/v1/runs/{run_id}",
+        # Durable privacy marker: restart hydration re-derives
+        # ``_private_run_ids`` membership from it so the GET/SSE/steer/
+        # approval gates keep applying after the gateway restarts.
+        "private": True,
+    }
+
+
+def _private_run_grant_denied(
+    self, request: "web.Request", run_id: str, *, _api_server
+) -> bool:
+    """Private runs are visible only with a valid grant header."""
+    if run_id not in self._private_run_ids:
+        return False
+    return (
+        _private_grant_attempt_id(self, request, _api_server=_api_server) is None
     )
 
 
@@ -78,6 +318,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # Active approval session key for each run_id. The approval core resolves
     # requests by session key, while API clients address them by run_id.
     self._run_approval_sessions: Dict[str, str] = {}
+    # Runs admitted through the private grant lane (DE_DESIGN §2/§4).
+    self._private_run_ids: set[str] = set()
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -144,8 +386,13 @@ def _set_run_status(
         )
     )
     if run_id in self._run_idempotency_ids and should_persist:
+        durable = (
+            _project_private_run_status(current)
+            if run_id in self._private_run_ids
+            else current
+        )
         try:
-            self._run_idempotency_store.update_status(run_id, current)
+            self._run_idempotency_store.update_status(run_id, durable)
         except Exception:
             logger.exception(
                 "[api_server] failed to persist idempotent run status %s", run_id
@@ -164,6 +411,16 @@ def _make_run_event_callback(
     redact_sensitive_text = _api_server.redact_sensitive_text
 
     def _push(event: Dict[str, Any]) -> None:
+        if run_id in self._private_run_ids:
+            # Lifecycle boundaries only: content previews (reasoning text,
+            # tool args, subagent text) never leave a private run's process.
+            if event.get("event") == "reasoning.available":
+                return
+            event = {
+                key: value
+                for key, value in event.items()
+                if key in _PRIVATE_EVENT_KEYS
+            }
         self._set_run_status(
             run_id,
             self._run_statuses.get(run_id, {}).get("status", "running"),
@@ -296,6 +553,13 @@ def _run_idempotency_scope(
     profile = _api_request_profile.get() or "default"
     expected_key = self._expected_api_key()
     identity = expected_key or "unauthenticated-test-listener"
+    grant_attempt = _private_grant_attempt_id(
+        self, request, _api_server=_api_server
+    )
+    if grant_attempt:
+        # Grant-fenced scope: replay/owns_run/status of a private run are
+        # invisible to profile-key holders without the grant (§1.1 #23).
+        identity = f"{identity}\0private-grant\0{grant_attempt}"
     return hashlib.sha256(f"{profile}\0{identity}".encode()).hexdigest()
 
 
@@ -364,6 +628,10 @@ def _durable_run_status(
         return None
 
     status = dict(record["status"])
+    if status.get("private") is True:
+        # Hydration re-derives privacy from the durable marker so the
+        # private-run gates keep applying after a gateway restart.
+        self._private_run_ids.add(run_id)
     owner_pid = int(record.get("owner_pid") or 0)
     owner_started = int(record.get("owner_started") or 0)
     nonterminal = status.get("status") not in {
@@ -394,6 +662,12 @@ def _durable_run_status(
                 "updated_at": time.time(),
             }
         )
+        if status.get("private") is True:
+            # Single choke point: every durable write for a private run
+            # flows through the metadata-only projection — no raw error /
+            # last_event keys may reach status_json.
+            status["error_class"] = "gateway_restart_interrupted"
+            status = _project_private_run_status(status)
         self._run_idempotency_store.update_status(run_id, status)
 
     self._run_statuses[run_id] = status
@@ -427,6 +701,18 @@ async def _handle_runs(
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
     if key_err is not None:
+        # Private-lane precedence: a session-key header is a 400-rejected
+        # linkage vector when a grant rides the request, even where the
+        # public lane would 403 the header itself (DE_DESIGN §1.1 #14).
+        attempt_id, _expiry, grant_err = _verify_private_grant_admission(
+            self, request, _api_server=_api_server
+        )
+        if grant_err is not None:
+            return grant_err
+        if attempt_id is not None:
+            return _reject_private_linkage(
+                {}, "X-Hermes-Session-Key", _openai_error=_openai_error
+            )
         return key_err
 
     try:
@@ -449,6 +735,34 @@ async def _handle_runs(
         and isinstance(body.get("_room_execution_policy"), dict)
         else None
     )
+
+    # Private lane admission (DE_DESIGN §4): verify the grant after auth and
+    # before the response-store lookup, history load, and session precedence.
+    # Invalid/expired/malformed => 403 with no run and no reservation consumed.
+    private_attempt_id, private_grant_expiry, grant_err = (
+        _verify_private_grant_admission(self, request, _api_server=_api_server)
+    )
+    if grant_err is not None:
+        return grant_err
+    if private_attempt_id is not None:
+        # A grant holder must not smuggle room authority through raw body
+        # keys: the room-policy pass-through below would override the
+        # private lane's toolset clamp / approval mode.
+        if isinstance(body, dict) and (
+            "hosted_room_dispatch" in body or "_room_execution_policy" in body
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Private runs reject room dispatch keys.",
+                    code="private_run_room_rejected",
+                ),
+                status=400,
+            )
+        linkage_err = _reject_private_linkage(
+            body, gateway_session_key, _openai_error=_openai_error
+        )
+        if linkage_err is not None:
+            return linkage_err
 
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
     if idempotency_key and (
@@ -619,6 +933,19 @@ async def _handle_runs(
         or self._declared_conversation_session(gateway_session_key)
         or run_id
     )
+    private_policy = None
+    if private_attempt_id is not None:
+        # Linkage inputs were 400-rejected above; force the isolated session
+        # explicitly anyway so the run id is always the session identity.
+        session_id = run_id
+        private_policy = _mint_private_policy(
+            body,
+            run_id=run_id,
+            attempt_id=private_attempt_id,
+            expiry=private_grant_expiry,
+            profile=_api_request_profile.get() or "default",
+        )
+        self._private_run_ids.add(run_id)
     # Approval queues gate host-side tool execution and must be isolated
     # per API run. Client-provided session IDs and memory session keys are
     # conversation/memory scopes, not authorization namespaces: multiple
@@ -643,6 +970,10 @@ async def _handle_runs(
     # Also wire stream_delta_callback so message.delta events flow through.
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None:
+            return
+        # Private runs stream lifecycle events only; run.completed carries
+        # the output on the grant-authenticated stream instead.
+        if run_id in self._private_run_ids:
             return
         if run_id not in self._run_streams:
             return
@@ -669,7 +1000,9 @@ async def _handle_runs(
             idempotency_key,
             idempotency_fingerprint,
             run_id,
-            initial_status,
+            _project_private_run_status(initial_status)
+            if private_policy is not None
+            else initial_status,
             owner_pid=self._run_owner_pid,
             owner_started=self._run_owner_started,
             retention_until=_room_retention_until(request),
@@ -680,6 +1013,7 @@ async def _handle_runs(
             self._run_approval_sessions.pop(run_id, None)
             self._run_statuses.pop(run_id, None)
             self._run_owners.pop(run_id, None)
+            self._private_run_ids.discard(run_id)
             if outcome == "conflict":
                 return web.json_response(
                     _openai_error(
@@ -716,6 +1050,13 @@ async def _handle_runs(
     )
 
     async def _run_and_close():
+        # Bind before construction so construction-time work already runs
+        # inside the private policy context (DE_DESIGN §4 bind point 4).
+        private_policy_token = (
+            bind_private_policy(private_policy)
+            if private_policy is not None
+            else None
+        )
         try:
             self._set_run_status(run_id, "running")
             if run_id in self._stopping_run_ids:
@@ -743,6 +1084,11 @@ async def _handle_runs(
                     route=route,
                     room_dispatch=room_dispatch,
                     room_execution_policy=room_execution_policy,
+                    **(
+                        {"private_execution_policy": private_policy}
+                        if private_policy is not None
+                        else {}
+                    ),
                 )
             self._active_run_agents[run_id] = agent
 
@@ -790,6 +1136,7 @@ async def _handle_runs(
                 approval_token = None
                 session_tokens = []
                 room_policy_token = None
+                private_worker_token = None
                 with self._profile_scope(request_profile):
                     try:
                         # Bind approval/session identity for this API run via
@@ -825,6 +1172,12 @@ async def _handle_runs(
                                 room_execution_policy or {}
                             )
                             room_policy_token = bind_room_execution_policy(policy)
+                        if private_policy is not None:
+                            # ContextVars do not cross run_in_executor —
+                            # re-bind explicitly inside the worker thread.
+                            private_worker_token = bind_private_policy(
+                                private_policy
+                            )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         # /v1/runs runs its own agent lifecycle (no
                         # TurnRunner, no _run_agent) — record turn process
@@ -875,6 +1228,15 @@ async def _handle_runs(
                                     reset_room_execution_policy(room_policy_token)
                                 except Exception:
                                     pass
+                            if private_worker_token is not None:
+                                try:
+                                    reset_private_policy(private_worker_token)
+                                except Exception:
+                                    logger.exception(
+                                        "[api_server] failed to reset private"
+                                        " policy in run worker %s",
+                                        run_id,
+                                    )
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -902,7 +1264,13 @@ async def _handle_runs(
             # 401/400 return failed=True instead of raising, so the except
             # block below never fires — issue #15561).
             elif isinstance(result, dict) and result.get("failed"):
-                error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                if private_policy is not None:
+                    # Fixed error class only — never the failure prose.
+                    error_msg = "run_failed"
+                else:
+                    error_msg = _redact_api_error_text(
+                        result.get("error") or "agent run failed"
+                    )
                 _put_event_if_active({
                     "event": "run.failed",
                     "run_id": run_id,
@@ -914,6 +1282,11 @@ async def _handle_runs(
                     "failed",
                     error=error_msg,
                     last_event="run.failed",
+                    **(
+                        {"error_class": "run_failed"}
+                        if private_policy is not None
+                        else {}
+                    ),
                 )
             else:
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -962,13 +1335,34 @@ async def _handle_runs(
             # message the other endpoints give a provider auth/credential
             # failure, instead of falling through to the generic
             # except-Exception branch below.
-            logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-            error_msg = f"⚠️ Provider authentication failed: {exc}"
+            if private_policy is not None:
+                # Fixed error class only — provider errors can embed request
+                # prose, and private-run logs never carry str(exc).
+                # Fixed template + identifier arg only: the allow marker
+                # lets this sanitized line pass the private log filter so
+                # operators are not blind to private-run failures.
+                logger.warning(
+                    "Provider authentication failed for run=%s:"
+                    " provider_auth_failed",
+                    run_id,
+                    extra={"hermes_private_allow": True},
+                )
+                error_msg = "provider_auth_failed"
+            else:
+                logger.warning(
+                    "Provider authentication failed for run=%s: %s", run_id, exc
+                )
+                error_msg = f"⚠️ Provider authentication failed: {exc}"
             self._set_run_status(
                 run_id,
                 "failed",
                 error=error_msg,
                 last_event="run.failed",
+                **(
+                    {"error_class": "provider_auth_failed"}
+                    if private_policy is not None
+                    else {}
+                ),
             )
             try:
                 _put_event_if_active({
@@ -980,19 +1374,38 @@ async def _handle_runs(
             except Exception:
                 pass
         except Exception as exc:
-            logger.exception("[api_server] run %s failed", run_id)
+            if private_policy is not None:
+                # No traceback and no str(exc): exception text from a private
+                # run can carry private prose into shared logs.
+                # Fixed template + identifier arg only: the allow marker
+                # lets this sanitized line pass the private log filter so
+                # operators are not blind to private-run failures.
+                logger.error(
+                    "[api_server] private run %s failed: run_failed",
+                    run_id,
+                    extra={"hermes_private_allow": True},
+                )
+                error_text = "run_failed"
+            else:
+                logger.exception("[api_server] run %s failed", run_id)
+                error_text = _redact_api_error_text(exc)
             self._set_run_status(
                 run_id,
                 "failed",
-                error=_redact_api_error_text(exc),
+                error=error_text,
                 last_event="run.failed",
+                **(
+                    {"error_class": "run_failed"}
+                    if private_policy is not None
+                    else {}
+                ),
             )
             try:
                 _put_event_if_active({
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "error": _redact_api_error_text(exc),
+                    "error": error_text,
                 })
             except Exception:
                 pass
@@ -1017,6 +1430,15 @@ async def _handle_runs(
             self._active_run_tasks.pop(run_id, None)
             self._run_approval_sessions.pop(run_id, None)
             self._stopping_run_ids.discard(run_id)
+            if private_policy_token is not None:
+                try:
+                    reset_private_policy(private_policy_token)
+                except Exception:
+                    logger.exception(
+                        "[api_server] failed to reset private policy for"
+                        " run %s",
+                        run_id,
+                    )
             self._release_run_owner_if_forgotten(run_id)
 
     self._activate_admitted_request()
@@ -1084,7 +1506,16 @@ async def _handle_get_run(
     if auth_err:
         return auth_err
 
+    grant_err = _reject_query_grant(self, request, _api_server=_api_server)
+    if grant_err is not None:
+        return grant_err
+
     run_id = request.match_info["run_id"]
+    if _private_run_grant_denied(self, request, run_id, _api_server=_api_server):
+        return web.json_response(
+            _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+            status=404,
+        )
     if not self._request_owns_run(request, run_id):
         return web.json_response(
             _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -1119,7 +1550,16 @@ async def _handle_run_events(
     if auth_err:
         return auth_err
 
+    grant_err = _reject_query_grant(self, request, _api_server=_api_server)
+    if grant_err is not None:
+        return grant_err
+
     run_id = request.match_info["run_id"]
+    if _private_run_grant_denied(self, request, run_id, _api_server=_api_server):
+        return web.json_response(
+            _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+            status=404,
+        )
     if not self._request_owns_run(request, run_id):
         return web.json_response(
             _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -1185,6 +1625,10 @@ async def _handle_run_approval(
     if auth_err:
         return auth_err
 
+    grant_err = _reject_query_grant(self, request, _api_server=_api_server)
+    if grant_err is not None:
+        return grant_err
+
     run_id = request.match_info["run_id"]
     if not self._request_owns_run(request, run_id):
         return web.json_response(
@@ -1207,6 +1651,9 @@ async def _handle_run_approval(
     aliases = {"approve": "once", "approved": "once", "allow": "once"}
     choice = aliases.get(raw_choice, raw_choice)
     room_scoped = bool(self._room_grant_token(request))
+    # A private run's "always"/"session" choice would write a durable
+    # allowlist entry outliving the grant — restrict to once/deny (§1.1 #20).
+    private_scoped = run_id in self._private_run_ids
     raw_request_id = body.get("request_id")
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
     if raw_request_id is not None and (not request_id or len(request_id) > 256):
@@ -1217,7 +1664,7 @@ async def _handle_run_approval(
             ),
             status=400,
         )
-    allowed = {"once", "deny"} if room_scoped else {
+    allowed = {"once", "deny"} if room_scoped or private_scoped else {
         "once",
         "session",
         "always",
@@ -1324,6 +1771,10 @@ async def _handle_steer_run(
     if auth_err:
         return auth_err
 
+    grant_err = _reject_query_grant(self, request, _api_server=_api_server)
+    if grant_err is not None:
+        return grant_err
+
     run_id = request.match_info["run_id"]
     if not self._request_owns_run(request, run_id):
         return web.json_response(
@@ -1335,6 +1786,19 @@ async def _handle_steer_run(
         return web.json_response(
             _openai_error(f"Run not found: {run_id}", code="run_not_found"),
             status=404,
+        )
+    # Checked after hydration: a restart-hydrated private run must hit this
+    # gate on its first post-restart request, not only after a prior GET.
+    if run_id in self._private_run_ids:
+        # Steer injects free text into the model context and leaves a durable
+        # pending_steer residue — the sink class is eliminated entirely for
+        # private runs (DE_DESIGN §1.1 #15).
+        return web.json_response(
+            _openai_error(
+                f"Private runs do not accept steer input: {run_id}",
+                code="private_run_no_steer",
+            ),
+            status=409,
         )
     # Only genuinely running runs are steerable. /stop retains agent/task
     # refs during cooperative shutdown, so the status gate (not the mere
@@ -1393,7 +1857,12 @@ async def _handle_stop_run(
     *,
     _api_server,
 ) -> "web.Response":
-    """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+    """POST /v1/runs/{run_id}/stop — interrupt a running agent.
+
+    The 200 ``stopping`` ACK is NOT terminal: bridge-visible status stays
+    non-terminal until the executor worker actually exits, so a lease must
+    never be released on this ACK alone (DE_DESIGN §3 step 5).
+    """
     _openai_error = _api_server._openai_error
     _reap_disconnected_agent_processes = (
         _api_server._reap_disconnected_agent_processes
@@ -1403,6 +1872,10 @@ async def _handle_stop_run(
     auth_err = self._check_run_auth(request, permission="stop")
     if auth_err:
         return auth_err
+
+    grant_err = _reject_query_grant(self, request, _api_server=_api_server)
+    if grant_err is not None:
+        return grant_err
 
     run_id = request.match_info["run_id"]
     if not self._request_owns_run(request, run_id):
@@ -1509,4 +1982,5 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     for run_id in stale_statuses:
         self._run_statuses.pop(run_id, None)
         self._run_idempotency_ids.discard(run_id)
+        self._private_run_ids.discard(run_id)
         self._release_run_owner_if_forgotten(run_id)

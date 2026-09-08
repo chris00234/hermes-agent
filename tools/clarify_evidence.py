@@ -42,6 +42,17 @@ class OriginalReply:
         )
 
 
+@dataclass(frozen=True)
+class OriginalCallback:
+    evidence: ClarifyEvidence
+    callback_query_id: str
+    update_id: str
+    option_index: int
+
+    def matches(self, response: str) -> bool:
+        return self.evidence.options[self.option_index] == response
+
+
 class ClarifyEvidence:
     def __init__(self, clarify_id, profile, question, options, timeout):
         self.clarify_id = clarify_id
@@ -58,13 +69,18 @@ class ClarifyEvidence:
         self.sequence = 0
         self.delivery = None
         self.closed = False
+        self.schema_version = 1
+        self.choice_buttons = ()
+        self.callback_snapshot = None
+        self.callback_ids = set()
+        self.callback_updates = set()
 
     def _emit(self, kind, **fields):
         from hermes_cli.lifecycle import invoke_hook
 
         self.sequence += 1
         payload = {
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "kind": kind,
             "clarify_id": self.clarify_id,
             "process_generation": _PROCESS_GENERATION,
@@ -92,7 +108,16 @@ class ClarifyEvidence:
             return False
         return True
 
-    def delivered(self, *, question, options, rendered_text, **transport):
+    def delivered(
+        self,
+        *,
+        question,
+        options,
+        rendered_text,
+        choice_buttons=(),
+        callback_snapshot=None,
+        **transport,
+    ):
         with self.lock:
             if self.closed or self.delivery or time.time() > self.expires_at:
                 return
@@ -101,6 +126,10 @@ class ClarifyEvidence:
             if len(rendered_text) > _MAX_RENDERED_CHARACTERS:
                 return
             self.delivery = transport
+            if choice_buttons and callback_snapshot is not None:
+                self.schema_version = 2
+                self.choice_buttons = copy.deepcopy(tuple(choice_buttons))
+                self.callback_snapshot = copy.deepcopy(callback_snapshot)
             if not self._emit(
                 "prompt_delivered",
                 message_id=transport["message_id"],
@@ -109,6 +138,11 @@ class ClarifyEvidence:
                 rendered_text=rendered_text,
                 expires_at=self.expires_at,
                 transport_ack=True,
+                **(
+                    {"choice_buttons": list(self.choice_buttons)}
+                    if self.schema_version == 2
+                    else {}
+                ),
             ):
                 self.closed = True
 
@@ -138,6 +172,43 @@ class ClarifyEvidence:
                 data["text"],
             )
 
+    def original_callback(self, data, snapshot):
+        with self.lock:
+            if (
+                self.schema_version != 2
+                or snapshot != self.callback_snapshot
+                or not self.matches_transport({
+                    **data,
+                    "reply_to_message_id": data["prompt_message_id"],
+                })
+                or data["callback_query_id"] in self.callback_ids
+                or data["update_id"] in self.callback_updates
+                or len(self.callback_ids) >= 128
+            ):
+                return None
+            button = next(
+                (
+                    button
+                    for button in self.choice_buttons
+                    if button["callback_data"] == data["callback_data"]
+                ),
+                None,
+            )
+            if button is None:
+                return None
+            self.callback_ids.add(data["callback_query_id"])
+            self.callback_updates.add(data["update_id"])
+            if not self._emit(
+                "original_callback", **data, option_index=button["option_index"]
+            ):
+                return None
+            return OriginalCallback(
+                self,
+                data["callback_query_id"],
+                data["update_id"],
+                button["option_index"],
+            )
+
     def close(self, reason, selected=None):
         with self.lock:
             if self.closed:
@@ -145,13 +216,31 @@ class ClarifyEvidence:
             self.closed = True
             if not self.delivery:
                 return
-            if not isinstance(selected, OriginalReply) or selected.evidence is not self:
+            if (
+                not isinstance(selected, (OriginalReply, OriginalCallback))
+                or selected.evidence is not self
+                or reason != "resolved"
+            ):
                 selected = None
+            reply = selected if isinstance(selected, OriginalReply) else None
+            callback = selected if isinstance(selected, OriginalCallback) else None
             self._emit(
                 "prompt_closed",
                 reason=reason,
-                selected_reply_message_id=selected.message_id if selected else None,
-                selected_reply_update_id=selected.update_id if selected else None,
+                selected_reply_message_id=reply.message_id if reply else None,
+                selected_reply_update_id=reply.update_id if reply else None,
+                **(
+                    {
+                        "selected_callback_query_id": callback.callback_query_id
+                        if callback
+                        else None,
+                        "selected_callback_update_id": callback.update_id
+                        if callback
+                        else None,
+                    }
+                    if self.schema_version == 2
+                    else {}
+                ),
             )
 
 
@@ -159,23 +248,31 @@ def for_source(source, clarify_id, question, choices, multi_select):
     from hermes_cli.lifecycle import has_hook
     from hermes_cli.profiles import get_active_profile_name
     from tools.clarify_gateway import get_clarify_timeout
+    from tools.clarify_tool import mark_recommended
 
     if (
         getattr(source.platform, "value", source.platform) != "telegram"
         or multi_select
         or not choices
         or not 2 <= len(choices) <= 10
-        or not all(isinstance(c, str) and 0 < len(c) <= 512 for c in choices)
+        or not all(isinstance(c, str) for c in choices)
         or not isinstance(question, str)
         or len(question) > 2048
         or not has_hook("gateway_platform_event")
     ):
         return None
+    # clarify_tool decorates choices[0] with "(Recommended)" before the gateway
+    # callback runs, so the strings the surfaces deliver are the decorated ones.
+    # Normalize (idempotently) before the length gate and store the decorated
+    # list, so validation and evidence labels match delivery exactly.
+    delivered = mark_recommended(list(choices))
+    if not all(0 < len(c) <= 512 for c in delivered):
+        return None
     return ClarifyEvidence(
         clarify_id,
         source.profile or get_active_profile_name(),
         question,
-        choices,
+        delivered,
         get_clarify_timeout(),
     )
 

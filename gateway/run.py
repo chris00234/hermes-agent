@@ -6373,6 +6373,12 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            # Bind the durable working-frame scope sink (contract B) so
+            # checkpoint ACKs persist for /reset //undo. Defensive: never
+            # breaks agent creation when the manager lacks the method.
+            from gateway.working_frame_scope import attach_working_frame_scope_sink
+
+            attach_working_frame_scope_sink(self._runner, agent, ctx.session_key)
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -17909,10 +17915,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             if not self._is_user_authorized_for_source(source):
                 return
-            if event.get("event_type") in {"clarify_original_candidate", "clarify_original_edited"}:
+            if event.get("event_type") in {"clarify_original_candidate", "clarify_original_edited", "clarify_callback_candidate"}:
                 from gateway.telegram_clarify_evidence import authorize_candidate
 
-                return authorize_candidate(event, source)
+                try:
+                    return authorize_candidate(event, source)
+                except Exception as exc:
+                    # WARNING with only the exception class: an evidence-path
+                    # bug must be visible without leaking message/callback data.
+                    logger.warning(
+                        "Clarify evidence authorization failed: %s",
+                        type(exc).__name__,
+                    )
+                    return None
             invoke_hook("gateway_platform_event", **event)
         except Exception:
             # Observer failures must never break the adapter's update loop.

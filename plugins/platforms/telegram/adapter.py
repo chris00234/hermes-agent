@@ -6722,7 +6722,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._clarify_state[clarify_id] = session_key
             from gateway.telegram_clarify_evidence import delivered
 
-            delivered(self, clarify_id, msg, question, choices, text)
+            delivered(self, clarify_id, msg, question, choices, text,
+                      kwargs.get("reply_markup"))
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
@@ -7755,7 +7756,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                         invalidate(self, query_chat_id, query.message.message_id)
                         await query.edit_message_text(
-                            text=f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
+                            text=f"❓ {_html.escape(query.message.text or '')}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
                             parse_mode=ParseMode.HTML,
                             reply_markup=None,
                         )
@@ -7774,25 +7775,38 @@ class TelegramAdapter(BasePlatformAdapter):
                 # clarify primitive.  Fall back to the index if the entry
                 # has been cleaned up (race with timeout / session reset).
                 resolved_text: Optional[str] = None
+                entry_alive = False
                 try:
                     from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
                     entry = _clarify_entries.get(clarify_id)
-                    if entry and entry.choices and 0 <= idx < len(entry.choices):
-                        resolved_text = entry.choices[idx]
+                    if entry and entry.choices:
+                        entry_alive = True
+                        if 0 <= idx < len(entry.choices):
+                            resolved_text = entry.choices[idx]
                 except Exception:
                     resolved_text = None
 
                 if resolved_text is None:
+                    if entry_alive:
+                        # Live entry, out-of-range index (crafted callback_data):
+                        # never fabricate a choice — leave the prompt open.
+                        await query.answer(text="Invalid choice.")
+                        return
                     # Race: entry vanished. Echo the index as a number so
                     # the agent at least sees an intentional response
                     # rather than nothing.
                     resolved_text = f"choice {idx + 1}"
 
+                from gateway.telegram_clarify_callbacks import capture
+
+                selected_callback = await capture(self, update, clarify_id)
                 # Pop state and resolve
                 self._clarify_state.pop(clarify_id, None)
                 try:
                     from tools.clarify_gateway import resolve_gateway_clarify
-                    resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+                    resolved = resolve_gateway_clarify(
+                        clarify_id, resolved_text, selected_callback=selected_callback,
+                    )
                 except Exception as exc:
                     logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
                     resolved = False
