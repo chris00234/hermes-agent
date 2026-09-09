@@ -58,7 +58,7 @@ class SinkExercisingAgent(AIAgent):
         ]
         self._ensure_db_session()
         self._flush_messages_to_session_db(transcript, [])
-        self._save_session_log(transcript)
+        self._save_trajectory(transcript, base, completed=True)
         log = logging.getLogger("leak_sweep.agent")
         log.info("tool result %s", tool_marker)
         log.error("run error %s", base.replace("INPUT", "ERRLOG"))
@@ -133,9 +133,9 @@ def session_db(tmp_path):
 @pytest.fixture
 def sink_adapter(monkeypatch, session_db):
     _patch_create_agent_runtime(monkeypatch, {}, SinkExercisingAgent)
-    monkeypatch.setattr("run_agent.get_tool_definitions", lambda *a, **k: [])
-    monkeypatch.setattr("run_agent.check_toolset_requirements", lambda *a, **k: {})
-    monkeypatch.setattr("run_agent.OpenAI", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *a, **k: [])
+    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda *a, **k: {})
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", lambda *a, **k: MagicMock())
     monkeypatch.setattr("gateway.run._checkpoint_agent_kwargs", lambda cfg: {})
     import hermes_cli.config as config_mod
 
@@ -253,7 +253,7 @@ class TestLeakSweep:  # §6.4
         assert pub_in.replace("INPUT", "TOOLRESULT") in logs_raw
         assert pub_in.replace("INPUT", "ERRLOG") in logs_raw
         assert pub_in.replace("INPUT", "OUTPUT") in idem_raw
-        assert pub_in in sessions_raw  # JSON snapshot + request dump written
+        assert pub_in in sessions_raw  # Request dump remains a durable sink.
         assert pub_in.replace("INPUT", "TOOLRESULT") in spill_raw
         assert pub_in.replace("INPUT", "TURNBUDGET") in spill_raw
         assert pub_in.replace("INPUT", "TOOLRESULT") in stderr_raw

@@ -244,7 +244,7 @@ _CURRENT_PRIVATE_POLICY: ContextVar[PrivateExecutionPolicy | None] = ContextVar(
 )
 
 
-def bind_private_policy(policy: PrivateExecutionPolicy) -> Token:
+def bind_private_policy(policy: PrivateExecutionPolicy | None) -> Token:
     return _CURRENT_PRIVATE_POLICY.set(policy)
 
 

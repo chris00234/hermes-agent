@@ -182,7 +182,7 @@ async def test_reset_blocked_when_retirement_fails():
 
 @pytest.mark.asyncio
 async def test_reset_blocked_on_timeout(monkeypatch):
-    import gateway.slash_commands as _sc
+    import gateway.slash_commands_session as _sc
 
     monkeypatch.setattr(_sc, "_WORKING_FRAME_RETIRE_TIMEOUT_S", 0.05)
     manager = _FakeManager(delay=0.5)
@@ -412,7 +412,7 @@ async def test_undo_reports_frame_reset_when_rewind_finds_nothing():
 async def test_lagged_retirement_never_clears_after_fail_closed_reply(monkeypatch):
     """Executor lag past the gateway's fail-closed reply must not let the
     retirement clear the frame afterwards (abandoned-then-executed)."""
-    import gateway.slash_commands as _sc
+    import gateway.slash_commands_session as _sc
 
     monkeypatch.setattr(_sc, "_WORKING_FRAME_RETIRE_TIMEOUT_S", 0.05)
     manager = _FakeManager()
@@ -442,7 +442,7 @@ async def test_lagged_retirement_never_clears_after_fail_closed_reply(monkeypatc
 
 @pytest.mark.asyncio
 async def test_retirement_passes_remaining_deadline_to_manager():
-    import gateway.slash_commands as _sc
+    import gateway.slash_commands_session as _sc
 
     manager = _FakeManager()
     runner, session_key = _make_runner(scope=_ref(), manager=manager)

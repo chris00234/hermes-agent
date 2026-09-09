@@ -31,11 +31,11 @@ def _real_agent(quiet_mode: bool) -> AIAgent:
     """Real AIAgent shaped like a /v1/runs private agent (platform, flags)."""
     with (
         patch(
-            "run_agent.get_tool_definitions",
+            "model_tools.get_tool_definitions",
             return_value=_make_tool_defs("web_search"),
         ),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         agent = AIAgent(
             api_key="test-key-1234567890",
@@ -57,7 +57,7 @@ def _run_tool_batch(agent, executor_method: str, tool_count: int) -> None:
         for i in range(tool_count)
     ]
     msg = _mock_assistant_msg(content="", tool_calls=calls)
-    with patch("run_agent.handle_function_call", return_value=RESULT_MARKER):
+    with patch("model_tools.handle_function_call", return_value=RESULT_MARKER):
         getattr(agent, executor_method)(msg, [], "task-1")
 
 
@@ -90,17 +90,14 @@ class TestToolPreviewPrints:
         assert RESULT_MARKER in out
 
     def test_begin_tool_execution_gated_on_quiet_mode(self, capsys):
-        from agent.tool_executor import _begin_tool_execution
+        from agent.tool_executor import _begin_tool_execution, _ToolCallRef
 
         for quiet in (True, False):
             agent = _real_agent(quiet_mode=quiet)
             agent.tool_progress_mode = "all"
             _begin_tool_execution(
                 agent,
-                function_name="web_search",
-                function_args={"q": "SECRET-ARGS-91ab"},
-                effective_task_id="task",
-                tool_call_id="tc1",
+                _ToolCallRef("web_search", {"q": "SECRET-ARGS-91ab"}, "task", "tc1", []),
                 display_index=1,
             )
             out = capsys.readouterr().out

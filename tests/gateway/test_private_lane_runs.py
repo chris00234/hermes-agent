@@ -793,7 +793,9 @@ class TestEgressGating:
                 ready.wait(timeout=3.0)
                 await asyncio.sleep(0.1)
 
-                entry = approval_mod._ApprovalEntry({
+                from tools.approval_gateway_wait import _ApprovalEntry
+
+                entry = _ApprovalEntry({
                     "command": "bash -c danger",
                     "description": "private approval",
                     "pattern_keys": ["shell-c"],

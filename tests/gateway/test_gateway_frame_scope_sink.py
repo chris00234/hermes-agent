@@ -5,12 +5,13 @@ memory manager, and the sink must read the LIVE ``agent.session_id`` at call
 time (the agent rebinds session ids across rotations; a captured id would
 persist ACKs against a dead session).
 """
-import ast
-import inspect
 from types import SimpleNamespace
 
 from agent.memory_manager import MemoryManager
 from gateway import run as gateway_run
+from gateway.run_turn_runner import TurnRunner
+from gateway.session import SessionSource
+from gateway.config import Platform
 from gateway.working_frame_scope import attach_working_frame_scope_sink
 
 
@@ -79,37 +80,37 @@ def test_attach_is_defensive_about_missing_pieces():
     assert store.calls == []
 
 
-def _call_names(node):
-    return {
-        n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
-        for n in ast.walk(node)
-        if isinstance(n, ast.Call)
-    }
+def test_fresh_agent_creation_attaches_scope_sink(monkeypatch):
+    """Execute the extracted constructor, then checkpoint across a session rotation."""
+    monkeypatch.setattr(gateway_run, "_checkpoint_agent_kwargs", lambda config: {})
+    store = _RecordingStore()
+    manager = MemoryManager()
+    agent = SimpleNamespace(_memory_manager=manager, session_id="sess-1")
+    constructed = []
 
+    def create(**kwargs):
+        constructed.append(kwargs)
+        return agent
 
-def test_fresh_agent_creation_attaches_scope_sink():
-    """AST pin: the ``agent = ctx.AIAgent(...)`` fresh-agent block in
-    gateway/run.py must call ``attach_working_frame_scope_sink``."""
-    tree = ast.parse(inspect.getsource(gateway_run))
-    found = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        creates_agent = any(
-            isinstance(sub, ast.Assign)
-            and isinstance(sub.value, ast.Call)
-            and isinstance(sub.value.func, ast.Attribute)
-            and sub.value.func.attr == "AIAgent"
-            and isinstance(sub.value.func.value, ast.Name)
-            and sub.value.func.value.id == "ctx"
-            for sub in ast.walk(node)
-        )
-        if not creates_agent:
-            continue
-        assert "attach_working_frame_scope_sink" in _call_names(node), (
-            "the fresh-agent creation block in gateway/run.py must bind the "
-            "working-frame scope sink (attach_working_frame_scope_sink) so "
-            "checkpoint ACKs become durable for /reset //undo (contract B)"
-        )
-        found = True
-    assert found, "could not locate the ctx.AIAgent(...) fresh-agent block"
+    runner = SimpleNamespace(
+        session_store=store, _active_profile_name=lambda: "jenna", _session_db=None,
+        _prefill_messages=[], _service_tier=None, _refresh_fallback_model=lambda: None,
+    )
+    ctx = SimpleNamespace(
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1"),
+        AIAgent=create, user_config={}, enabled_toolsets=[], disabled_toolsets=[],
+        session_id="sess-1", session_key="telegram:c1",
+    )
+    result = TurnRunner(runner, ctx)._build_fresh_agent(
+        {"model": "test", "runtime": {}}, "telegram", "", 1, None, {}, False,
+    )
+    assert result is agent
+    assert constructed[0]["load_soul_identity"] is True
+    assert constructed[0]["gateway_session_key"] == ctx.session_key
+    manager._working_frame_scope_sink({"revision": 1})
+    agent.session_id = "sess-2"
+    manager._working_frame_scope_sink({"revision": 2})
+    assert store.calls == [
+        ("telegram:c1", "sess-1", {"revision": 1}, "jenna"),
+        ("telegram:c1", "sess-2", {"revision": 2}, "jenna"),
+    ]

@@ -122,6 +122,10 @@ class MemoryLifecycle:
              timeout: float | None = None) -> Any:
         generation = None
         try:
+            # A nested worker call can execute synchronously in _enqueue;
+            # an already-expired deadline must reject before any provider runs.
+            if timeout is not None and timeout <= 0:
+                raise TimeoutError("Memory lifecycle deadline already expired")
             future, generation = self._enqueue(fn, transition=transition)
             wait = LIFECYCLE_TIMEOUT_SECONDS if timeout is None else timeout
             return future.result(timeout=wait)
