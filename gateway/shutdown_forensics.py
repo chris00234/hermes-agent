@@ -131,7 +131,7 @@ def _diagnostic_command(script: str, timeout_seconds: float) -> list[str]:
         "try:\n"
         "    sys.exit(child.wait(timeout=float(sys.argv[1])))\n"
         "except subprocess.TimeoutExpired:\n"
-        "    try: os.killpg(child.pid, signal.SIGKILL)\n"
+        "    try: os.killpg(child.pid, signal.SIGKILL)\n"  # windows-footgun: ok — spawn_async_diagnostic returns early on Windows
         "    except ProcessLookupError: pass\n"
         "    child.wait()\n"
         "    sys.exit(124)\n"
