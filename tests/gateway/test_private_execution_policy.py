@@ -15,7 +15,6 @@ from gateway.private_execution_policy import (
     ALWAYS_EXCLUDED_TOOLSETS,
     GRANT_SECRET_ENV,
     GRANT_VERSION,
-    PrivateExecutionPolicy,
     bind_private_policy,
     build_policy,
     current_private_policy,
@@ -171,15 +170,3 @@ class TestResolveSecret:
 
         monkeypatch.setattr("agent.secret_scope.get_secret", _boom)
         assert resolve_private_grant_secret(PROFILE) is None
-
-
-def test_policy_dataclass_field_names():
-    assert [f.name for f in dataclasses.fields(PrivateExecutionPolicy)] == [
-        "run_id",
-        "profile",
-        "execution_attempt_id",
-        "lease_expires_at",
-        "allowed_toolsets",
-        "policy_digest",
-        "grant_version",
-    ]

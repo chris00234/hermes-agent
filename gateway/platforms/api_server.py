@@ -3932,6 +3932,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _api_runs._release_run_owner_if_forgotten(self, run_id)
 
     _handle_get_run = _run_route_delegate("_handle_get_run")
+    _handle_run_lease = _run_route_delegate("_handle_run_lease")
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")

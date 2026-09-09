@@ -13,7 +13,8 @@ import json
 import logging
 import re
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,12 @@ class GrantError(ValueError):
     """A private execution grant is missing, malformed, or not authentic."""
 
 
+@dataclass
+class _LeaseExtension:
+    # Written only by the gateway event loop; shared with already-running tool threads.
+    expires_at: str = ""
+
+
 @dataclass(frozen=True)
 class PrivateExecutionPolicy:
     """Immutable per-run policy applied at the agent and tool boundaries."""
@@ -56,6 +63,27 @@ class PrivateExecutionPolicy:
     allowed_toolsets: frozenset[str]
     policy_digest: str
     grant_version: str
+    _lease: _LeaseExtension = field(default_factory=_LeaseExtension, compare=False, repr=False)
+
+    @property
+    def effective_lease_expires_at(self) -> str:
+        return self._lease.expires_at or self.lease_expires_at
+
+
+def renew_private_lease(
+    policy: PrivateExecutionPolicy, header_value: str, secret: str | None, *, profile: str, now: float,
+) -> str:
+    """Extend a live lease without changing the admission identity, digest or toolsets."""
+    attempt, expiry, toolsets = verify_grant(header_value, secret, profile=profile, now=now)
+    if (profile, attempt, frozenset(toolsets)) != (
+        policy.profile, policy.execution_attempt_id, policy.allowed_toolsets,
+    ):
+        raise GrantError("renewal must preserve the execution identity and toolsets")
+    current = datetime.fromisoformat(policy.effective_lease_expires_at).timestamp()
+    if current <= now or expiry < current or expiry > now + 1800:
+        raise GrantError("renewal must extend a live lease by at most 30 minutes")
+    policy._lease.expires_at = datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat()
+    return policy._lease.expires_at
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:

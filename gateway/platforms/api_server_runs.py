@@ -368,6 +368,7 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+        ("POST", "/v1/runs/{run_id}/lease", self._handle_run_lease),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
 
@@ -1113,6 +1114,28 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
     return err if err is not None else web.json_response(status)
+
+
+async def _handle_run_lease(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Renew only an owned, running private execution using a fresh signed grant."""
+    from gateway.private_execution_policy import renew_private_lease
+
+    run_id, status, agent, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission=None, active_fallback=False)
+    if err is not None:
+        return err
+    policy = getattr(agent, "_private_execution_policy", None) if agent is not None else None
+    if run_id not in self._private_run_ids or status.get("status") != "running" or not isinstance(policy, PrivateExecutionPolicy):
+        return web.json_response(_api_server._openai_error("No live private lease.", code="lease_unavailable"), status=409)
+    profile = _grant_serving_profile(_api_server=_api_server)
+    try:
+        expiry = renew_private_lease(
+            policy, request.headers.get(_PRIVATE_GRANT_HEADER), resolve_private_grant_secret(profile),
+            profile=profile, now=time.time())
+    except (GrantError, ValueError) as exc:
+        return web.json_response(_api_server._openai_error(str(exc), code="invalid_private_grant"), status=403)
+    return web.json_response({"run_id": run_id, "execution_attempt_id": policy.execution_attempt_id,
+                              "lease_expires_at": expiry})
 
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":

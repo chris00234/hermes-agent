@@ -385,7 +385,7 @@ def _private_execution_block_message(agent, function_name: str) -> str | None:
                 f"Tool blocked: {function_name} is outside the private "
                 "execution grant"
             )
-        if not _private_lease_active(context_policy.lease_expires_at):
+        if not _private_lease_active(context_policy.effective_lease_expires_at):
             return "Tool blocked: private execution lease expired"
     except Exception:
         return "Tool blocked: private execution policy check failed"
