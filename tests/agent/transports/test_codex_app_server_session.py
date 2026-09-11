@@ -202,6 +202,20 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
+    def test_native_turn_options_and_expired_budget_do_not_replay(self):
+        client = FakeClient()
+        session = make_session(client)
+        expired = session.run_turn("do not start", turn_timeout=0)
+        assert expired.interrupted
+        assert client.requests == []
+        client.queue_notification("turn/completed", threadId="t", turn={"id": "tu1", "status": "completed"})
+        completed = session.run_turn("hello", model="gpt-6-astra", reasoning_effort="high", turn_timeout=None)
+        assert not completed.error
+        starts = [params for method, params in client.requests if method == "turn/start"]
+        assert len(starts) == 1
+        assert starts[0]["model"] == "gpt-6-astra"
+        assert starts[0]["effort"] == "high"
+
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching

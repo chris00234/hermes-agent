@@ -49,6 +49,9 @@ class TurnResult:
     # Exact turn/start text distinguishes the input echo from a new user event.
     submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_total: Optional[dict[str, Any]] = None
+    token_usage_snapshot: Optional[dict[str, Any]] = field(default=None, repr=False)
+    api_call_count: int = 0
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Codex likely wedged (turn timeout, watchdog, token refresh failure): caller respawns next turn.
@@ -332,7 +335,8 @@ class CodexAppServerSession:
         return projection, aborted
 
     def run_turn(
-        self, user_input: Any, *, turn_timeout: float = 600.0,
+        self, user_input: Any, *, turn_timeout: Optional[float] = 600.0,
+        model: Optional[str] = None, reasoning_effort: Optional[str] = None,
         notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: Optional[float] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
@@ -341,6 +345,10 @@ class CodexAppServerSession:
         liveness checks remain active; callers may explicitly opt into a shorter post-tool watchdog.
         """
         result = TurnResult()
+        if turn_timeout is not None and turn_timeout <= 0:
+            result.interrupted = True
+            result.error = "Codex run budget exhausted before turn/start"
+            return result
         if self._start_for(result):
             # Do not clear first: a hard stop arriving during ensure_started() must
             # be honored before launching a Codex turn.
@@ -348,9 +356,14 @@ class CodexAppServerSession:
                 result.interrupted = True
             else:
                 result.submitted_user_text = _coerce_turn_input_text(user_input)
+                params = {"threadId": self._thread_id, "input": [{"type": "text", "text": result.submitted_user_text}]}
+                if model:
+                    params["model"] = model
+                if reasoning_effort:
+                    params["effort"] = reasoning_effort
                 ts = self._request_for(
                     result, "turn/start",
-                    {"threadId": self._thread_id, "input": [{"type": "text", "text": result.submitted_user_text}]},
+                    params,
                     "turn/start",
                 )
                 if ts is not None:
@@ -359,7 +372,7 @@ class CodexAppServerSession:
         return result
 
     def _run_started_turn(
-        self, result: TurnResult, ts: dict, turn_timeout: float, notification_poll_timeout: float,
+        self, result: TurnResult, ts: dict, turn_timeout: Optional[float], notification_poll_timeout: float,
         post_tool_quiet_timeout: Optional[float],
     ) -> None:
         """Drive an accepted ``turn/start`` to completion: watchdog, approvals, projection."""
@@ -426,7 +439,7 @@ class CodexAppServerSession:
             self._active_turn_id = None
 
     def _drive_turn(
-        self, result: TurnResult, *, turn_timeout: float, notification_poll_timeout: float,
+        self, result: TurnResult, *, turn_timeout: Optional[float], notification_poll_timeout: float,
         timeout_label: str, on_server_request: Callable[[dict], bool],
         on_note: Callable[[dict, str], bool], before_poll: Optional[Callable[[], bool]] = None,
         pre_scope_filter: Optional[Callable[[dict, str], bool]] = None,
@@ -440,7 +453,7 @@ class CodexAppServerSession:
         return True to complete the turn. Deadline without completion interrupts and
         retires the session.
         """
-        deadline = time.monotonic() + turn_timeout
+        deadline = time.monotonic() + turn_timeout if turn_timeout is not None else float("inf")
         turn_complete = False
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -669,9 +682,9 @@ def _apply_accounting_notification(result: TurnResult, note: dict) -> None:
     if method == "thread/tokenUsage/updated":
         token_usage = params.get("tokenUsage") or {}
         if isinstance(token_usage, dict):
-            last, window = token_usage.get("last"), token_usage.get("modelContextWindow")
-            if isinstance(last, dict):
-                result.token_usage_last = dict(last)
+            from agent.codex_usage import record_usage
+            record_usage(result, token_usage)
+            window = token_usage.get("modelContextWindow")
             if isinstance(window, int) and window > 0:
                 result.model_context_window = window
         return
