@@ -384,6 +384,7 @@ def _ensure_codex_session(agent) -> None:
     if getattr(agent, "_codex_session", None) is not None:
         return
     from agent.runtime_cwd import resolve_agent_cwd
+    from agent.codex_session_state import load_thread_id, save_thread_id
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
     # Approval callback: Hermes' standard prompt flow when a CLI thread installed one.
     approval_callback = None
@@ -404,6 +405,8 @@ def _ensure_codex_session(agent) -> None:
     # interim commentary while codex_app_server is running — only the final answer (#33200). Supersedes the
     # narrower item/started-only bridge from #38835.
     agent._codex_session = CodexAppServerSession(
+        resume_thread_id=load_thread_id(agent),
+        on_thread_started=lambda thread_id: save_thread_id(agent, thread_id),
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),

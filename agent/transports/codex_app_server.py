@@ -63,6 +63,10 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         cmd = [codex_bin, "app-server", *(extra_args or [])]
+        from hermes_constants import get_hermes_home
+
+        # The shared Codex config may still pin the profile that last ran migration.
+        cmd += ["-c", f'mcp_servers.hermes-tools.env.HERMES_HOME={json.dumps(str(get_hermes_home()))}']
         from agent.delegation_context import (
             DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
             delegated_child_subprocess_env, is_dispatcher_owned_worker_context,

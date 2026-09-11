@@ -44,6 +44,24 @@ def _bare_agent() -> AIAgent:
 
 
 class TestSteerAcceptance:
+    @pytest.mark.parametrize("accepted", [True, False])
+    def test_native_steer_uses_codex_receipt_without_leaving_unconsumed_queue(self, accepted):
+        from types import SimpleNamespace
+
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        delivered = []
+
+        def request_steer(text):
+            delivered.append(text)
+            return accepted
+
+        agent._codex_session = SimpleNamespace(request_steer=request_steer)
+        assert agent.steer("also check the disk") is accepted
+        assert delivered == ["also check the disk"]
+        assert agent._pending_steer is None
+        assert agent._interrupt_requested is False
+
     def test_accepts_non_empty_text(self):
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True

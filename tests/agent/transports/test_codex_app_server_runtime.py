@@ -124,16 +124,18 @@ class TestSpawnEnvIsolation:
     RUST_LOG on top of os.environ.copy().
     """
 
-    def test_spawn_env_preserves_HOME(self, monkeypatch):
+    def test_spawn_env_preserves_HOME(self, monkeypatch, tmp_path):
         """The spawn env must contain the parent process's HOME unchanged.
         Verifies via a subprocess-monkey-patch."""
         import subprocess
+        import tomllib
         from agent.transports import codex_app_server as cas
 
         captured = {}
 
         class FakePopen:
             def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = cmd
                 captured["env"] = kwargs.get("env", {}).copy()
                 # Provide minimal Popen surface so __init__ doesn't crash
                 # on attribute access during construction.
@@ -157,9 +159,14 @@ class TestSpawnEnvIsolation:
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
         monkeypatch.setenv("HOME", "/users/alice")
+        profile_home = tmp_path / 'profile "study"'
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True  # so close() is a no-op
+        overrides = [captured["cmd"][i + 1] for i, value in enumerate(captured["cmd"]) if value == "-c"]
+        parsed = tomllib.loads("\n".join(overrides))
+        assert parsed["mcp_servers"]["hermes-tools"]["env"]["HERMES_HOME"] == str(profile_home)
 
         # The spawn env must have HOME=/users/alice unchanged
         assert captured["env"].get("HOME") == "/users/alice", (
@@ -339,4 +346,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

@@ -155,6 +155,8 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        resume_thread_id: Optional[str] = None,
+        on_thread_started: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -169,6 +171,8 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._resume_thread_id = resume_thread_id
+        self._on_thread_started = on_thread_started
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -186,7 +190,9 @@ class CodexAppServerSession:
         self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
         # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
         # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.
-        result = self._client.request("thread/start", {"cwd": self._cwd}, timeout=15)
+        method = "thread/resume" if self._resume_thread_id else "thread/start"
+        params = {"threadId": self._resume_thread_id} if self._resume_thread_id else {"cwd": self._cwd}
+        result = self._client.request(method, params, timeout=15)
         # Different codex versions serialize the id under thread.id / sessionId / threadId.
         thread_obj = result.get("thread") or {}
         thread_id = thread_obj.get("id") or thread_obj.get("sessionId") or result.get("sessionId") or result.get("threadId")
@@ -195,6 +201,8 @@ class CodexAppServerSession:
                 code=-32603, message=f"codex thread/start returned no thread id (payload keys: {sorted(result.keys())})",
             )
         self._thread_id = thread_id
+        if self._on_thread_started is not None:
+            self._on_thread_started(thread_id)
         logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
         return thread_id
 
@@ -325,16 +333,12 @@ class CodexAppServerSession:
 
     def run_turn(
         self, user_input: Any, *, turn_timeout: float = 600.0,
-        notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
+        notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: Optional[float] = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
-        post_tool_quiet_timeout: silence this long after a tool completes fast-fails and retires.
-
-        post_tool_quiet_timeout: if codex emits a tool completion and then goes quiet for this many seconds
-        without emitting another item or `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697) so a wedged codex doesn't burn the
-        full turn deadline.
+        Quiet reasoning is not evidence of a stalled native turn. The overall deadline and subprocess
+        liveness checks remain active; callers may explicitly opt into a shorter post-tool watchdog.
         """
         result = TurnResult()
         if self._start_for(result):
@@ -356,7 +360,7 @@ class CodexAppServerSession:
 
     def _run_started_turn(
         self, result: TurnResult, ts: dict, turn_timeout: float, notification_poll_timeout: float,
-        post_tool_quiet_timeout: float,
+        post_tool_quiet_timeout: Optional[float],
     ) -> None:
         """Drive an accepted ``turn/start`` to completion: watchdog, approvals, projection."""
         projector = CodexEventProjector()
@@ -367,6 +371,8 @@ class CodexAppServerSession:
         last_tool_completion_at: Optional[float] = None
 
         def watchdog_tripped() -> bool:
+            if post_tool_quiet_timeout is None:
+                return False
             if last_tool_completion_at is None or (time.monotonic() - last_tool_completion_at) <= post_tool_quiet_timeout:
                 return False
             self._issue_interrupt(result.turn_id)

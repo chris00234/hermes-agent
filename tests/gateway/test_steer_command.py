@@ -92,6 +92,21 @@ def _session_entry() -> SessionEntry:
 
 
 @pytest.mark.asyncio
+async def test_rejected_native_steer_is_queued_at_turn_boundary():
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    running_agent = MagicMock()
+    running_agent.steer.return_value = False
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer check the disk"))
+
+    assert "queued for the next turn" in result
+    assert runner._queue_depth(sk, adapter=adapter) == 1
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_steer_calls_agent_steer_and_does_not_interrupt():
     """When an agent is running, /steer must call agent.steer(text) and
     leave interrupt state untouched."""

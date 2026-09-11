@@ -220,6 +220,10 @@ class InterruptControlMixin:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            if _ic_codex_method(self, "request_steer") is None:
+                return False
+            return self.redirect(cleaned)
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
