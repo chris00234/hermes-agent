@@ -170,13 +170,17 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("POST", "/v1/room-members/grants/refresh"),
         ("POST", "/v1/room-members/grants/revoke"),
     ]
-    assert [(method, path) for method, path, _ in run_routes] == [
-        ("POST", "/v1/runs"),
-        ("GET", "/v1/runs/{run_id}"),
-        ("GET", "/v1/runs/{run_id}/events"),
-        ("POST", "/v1/runs/{run_id}/approval"),
-        ("POST", "/v1/runs/{run_id}/steer"),
-        ("POST", "/v1/runs/{run_id}/stop"),
-    ]
+    run_handlers = {(method, path): handler for method, path, handler in run_routes}
+    expected_handlers = {
+        ("POST", "/v1/runs"): adapter._handle_runs,
+        ("GET", "/v1/runs/{run_id}"): adapter._handle_get_run,
+        ("GET", "/v1/runs/{run_id}/events"): adapter._handle_run_events,
+        ("POST", "/v1/runs/{run_id}/approval"): adapter._handle_run_approval,
+        ("POST", "/v1/runs/{run_id}/lease"): adapter._handle_run_lease,
+        ("POST", "/v1/runs/{run_id}/steer"): adapter._handle_steer_run,
+        ("POST", "/v1/runs/{run_id}/stop"): adapter._handle_stop_run,
+    }
+    for route, handler in expected_handlers.items():
+        assert run_handlers[route] == handler
     assert all(handler.__self__ is adapter for _, _, handler in room_routes)
     assert all(handler.__self__ is adapter for _, _, handler in run_routes)
