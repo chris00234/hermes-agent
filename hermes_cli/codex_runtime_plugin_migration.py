@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 MIGRATION_MARKER = (
     "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section")
 MIGRATION_END_MARKER = "# end hermes-agent managed section"
+
+_NATIVE_PERMISSION_KEYS = (
+    "default_permissions", "sandbox_mode", "approval_policy",
+    "permissions", "sandbox_workspace_write")
 
 
 @dataclass
@@ -398,9 +403,10 @@ def migrate(
     """Translate Hermes mcp_servers config + Codex curated plugins into ~/.codex/config.toml.
 
     ``discover_plugins`` spawns the live codex CLI (set False in tests); discovery is best-effort
-    and never blocks the migration. ``default_permission_profile`` (default ":workspace"; built-ins
-    carry a leading ":", user profiles do not; None leaves codex's read-only default) avoids an
-    approval prompt on every write. ``expose_hermes_tools`` registers Hermes' own tool surface
+    and never blocks the migration. ``default_permission_profile`` (default ":workspace") is
+    only a fallback when no native permission settings exist; None disables that fallback.
+    Existing settings, including edits inside the managed block, always take precedence.
+    ``expose_hermes_tools`` registers Hermes' own tool surface
     (agent/transports/hermes_tools_mcp_server.py, launched on demand by codex over stdio) as an MCP
     server so the codex subprocess can call back for tools it lacks.
     """
@@ -434,15 +440,11 @@ def migrate(
         # re-render and may strip pre-existing tables outside the managed block.
         plugin_query_succeeded = not plugin_err
         report.migrated_plugins += [f"{p['name']}@{p['marketplace']}" for p in plugins]
-    if default_permission_profile:
-        report.wrote_permissions_default = default_permission_profile
     if expose_hermes_tools:
         translated["hermes-tools"] = _build_hermes_tools_mcp_entry()
         if "hermes-tools" not in report.migrated:
             report.migrated.append("hermes-tools")
-    managed_block = render_codex_toml_section(
-        translated, plugins=plugins, default_permission_profile=default_permission_profile)
-    new_text = managed_block
+    existing = without_managed = ""
     if target.exists():
         try:
             existing = target.read_text(encoding="utf-8")
@@ -450,9 +452,41 @@ def migrate(
             report.errors.append(f"could not read {target}: {exc}")
             return report
         without_managed = _strip_existing_managed_block(existing)
-        if plugin_query_succeeded:
-            without_managed = _strip_unmanaged_plugin_tables(without_managed)
-        new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
+    try:
+        unmanaged = tomllib.loads(without_managed)
+    except tomllib.TOMLDecodeError as exc:
+        report.errors.append(f"invalid unmanaged TOML in {target}: {exc}")
+        return report
+    try:
+        native = tomllib.loads(existing)
+    except tomllib.TOMLDecodeError as exc:
+        report.errors.append(f"invalid existing TOML in {target}: {exc}")
+        return report
+    # Permission settings belong to the user even when an older migration emitted them.
+    restored = "".join(
+        f"{key} = {_format_toml_value(native[key])}\n"
+        for key in _NATIVE_PERMISSION_KEYS if key in native and key not in unmanaged)
+    if restored:
+        without_managed = _insert_managed_block_at_top_level(without_managed, restored)
+    if any(key in native for key in _NATIVE_PERMISSION_KEYS):
+        default_permission_profile = None
+    if default_permission_profile:
+        report.wrote_permissions_default = default_permission_profile
+    user_servers = unmanaged.get("mcp_servers", {})
+    if isinstance(user_servers, dict):
+        # User-owned entries include identity and approval fields we must not translate away.
+        translated = {name: cfg for name, cfg in translated.items() if name not in user_servers}
+        report.migrated = [name for name in report.migrated if name in translated]
+    if plugin_query_succeeded:
+        without_managed = _strip_unmanaged_plugin_tables(without_managed)
+    managed_block = render_codex_toml_section(
+        translated, plugins=plugins, default_permission_profile=default_permission_profile)
+    new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as exc:
+        report.errors.append(f"invalid generated TOML for {target}: {exc}")
+        return report
     if dry_run:
         return report
     try:
