@@ -561,6 +561,9 @@ class StreamTransportMixin:
         if self._is_flood_error(result):
             self._flood_strikes += 1
             self._current_edit_interval = min(self._current_edit_interval * 2, 10.0)
+            retry_after = getattr(result, "retry_after", None)
+            if isinstance(retry_after, (int, float)) and retry_after > 0:
+                self._current_edit_interval = max(self._current_edit_interval, retry_after)
             logger.debug("Flood control on edit (strike %d/%d), backoff interval → %.1fs",
                          self._flood_strikes, self._MAX_FLOOD_STRIKES, self._current_edit_interval)
             immediate_final_fallback = (

@@ -254,3 +254,77 @@ async def test_flood_capped_resend_keeps_single_bubble_reply_first(monkeypatch):
     # the recorded payload reconciles, so the normal final send is skipped.
     assert consumer.final_content_delivered is True
     assert consumer.delivered_final_matches("Final answer") is True
+
+
+@pytest.mark.asyncio
+async def test_long_edit_flood_blocks_stream_and_final_sends_until_deadline(monkeypatch):
+    from gateway import delivery_ledger as ledger
+
+    class FloodError(Exception):
+        retry_after = 185.0
+
+    now = [100.0]
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.time.monotonic", lambda: now[0])
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._rich_send_disabled = True
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(side_effect=FloodError("Retry after 185"))
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=789))
+    consumer = GatewayStreamConsumer(adapter, "123", StreamConsumerConfig(cursor=""))
+    consumer._message_id = "456"
+    consumer._last_sent_text = "Partial"
+    consumer._already_sent = True
+
+    assert not await consumer._send_or_edit("Partial completed answer", finalize=True, is_turn_final=True)
+    assert consumer._current_edit_interval == 185.0
+    await consumer._send_fallback_final("Partial completed answer")
+    assert not consumer.final_content_delivered
+    adapter._bot.edit_message_text.assert_awaited_once()  # no Markdown-to-plain flood retry
+    adapter._bot.send_message.assert_not_awaited()
+
+    now[0] += 184.0
+    result = await adapter.send("123", "Partial completed answer", metadata={"notify": True})
+    assert not result.success and result.retry_after == 1.0
+    adapter._bot.send_message.assert_not_awaited()
+    ledger.record_obligation(obligation_id="flood-final", session_key="session", platform="telegram",
+                             chat_id="123", thread_id=None, content="Partial completed answer")
+    ledger.mark_failed("flood-final", result.error)
+    import time
+    assert ledger.sweep_failed_for_runtime("telegram", now=time.time()) == []
+    due = ledger.sweep_failed_for_runtime("telegram", now=time.time() + 2.0)
+    assert len(due) == 1 and due[0]["needs_marker"]
+
+    now[0] += 2.0
+    result = await adapter.send("123", due[0]["content"], metadata={"notify": True})
+    assert result.success
+    adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_flood_also_blocks_edits_and_other_sends():
+    class FloodError(Exception):
+        retry_after = 120.0
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._rich_send_disabled = True
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=FloodError("Retry after 120"))
+    adapter._bot.edit_message_text = AsyncMock()
+    assert not (await adapter.send("123", "answer")).success
+    assert not (await adapter.edit_message("123", "456", "answer")).success
+    result = await adapter.send("123", "answer")
+    assert not result.success and 119 < result.retry_after <= 120
+    adapter._bot.send_message.assert_awaited_once()
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_edit_flood_keeps_canonical_delivery_deadline():
+    class FloodError(Exception):
+        retry_after = 185.0
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    result = adapter._rich_transient_result(FloodError("Retry after 185"), "rich editMessageText")
+    assert result.error == "flood_control:185.0"
+    assert result.retry_after == 185.0
+    assert adapter._flood_cooldown_result() is not None
