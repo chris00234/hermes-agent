@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config  # noqa: F401 — resolved lazily by siblings through the facade
 from gateway.status import terminate_pid
+from hermes_cli.gateway_service_process import gateway_pid_for_service
 from gateway.restart import (  # noqa: F401 — resolved lazily by siblings through the facade
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
@@ -223,6 +224,8 @@ def _get_service_pids(all_profiles: bool = False) -> set:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
+    workers = (gateway_pid_for_service(pid) for pid in tuple(pids))
+    pids.update(pid for pid in workers if pid is not None)
     return pids
 
 
@@ -273,6 +276,9 @@ def _request_gateway_self_restart(pid: int) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
     if not hasattr(signal, "SIGUSR1") or not _is_pid_ancestor_of_current_process(pid):
         return False
+    pid = gateway_pid_for_service(pid)
+    if pid is None:
+        return False
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
     except (ProcessLookupError, PermissionError, OSError):
@@ -289,6 +295,11 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float, *, on_progress
     a long wait can report what the gateway is still holding for (``update_cmd_drain_report``).
     """
     if not hasattr(signal, "SIGUSR1") or pid <= 0:
+        return False
+    # A pre-update timestamp wrapper may not forward USR1. Drain its gateway
+    # directly so the wrapper cannot exit first and orphan the old worker.
+    pid = gateway_pid_for_service(pid)
+    if pid is None:
         return False
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
@@ -928,9 +939,7 @@ def find_windows_gateway_services(
 
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
-    args = [get_python_path(), "-m", "hermes_cli.main"]
-    if profile != "default":
-        args.extend(["--profile", profile])
+    args = [get_python_path(), "-m", "hermes_cli.main", "--profile", profile]
     args.extend(["gateway", "run", "--replace"])
     return args
 
@@ -984,15 +993,49 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
 
 def launch_detached_gateway_restart_by_cmdline(old_pid: int, run_argv: list[str]) -> bool:
     """Relaunch a gateway with no profile→PID-file mapping by replaying its captured argv after exit."""
-    return old_pid > 0 and bool(run_argv) and _spawn_gateway_restart_watcher(old_pid, list(run_argv))
+    if old_pid <= 0 or not run_argv:
+        return False
+    import psutil
+    from gateway.status import profile_flag_value
+    from hermes_cli.profile_action_env import profile_action_environment
+    from hermes_cli.profiles import resolve_profile_env
+
+    profile = profile_flag_value(" ".join(run_argv))
+    try:
+        target_home = (
+            resolve_profile_env(profile) if profile is not None
+            else psutil.Process(old_pid).environ().get("HERMES_HOME")
+        )
+    except (psutil.Error, ValueError, FileNotFoundError):
+        return False
+    if not target_home:
+        return False
+    if profile is None:
+        home = Path(target_home)
+        profile = home.name if home.parent.name == "profiles" else "default"
+        # Pin the observed home even if active_profile changed since this
+        # gateway started; the CLI consumes selectors anywhere in its argv.
+        run_argv = [*run_argv, "--profile", profile]
+    env = profile_action_environment(Path(target_home))
+    return _spawn_gateway_restart_watcher(old_pid, list(run_argv), env=env)
 
 
 def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
     """Relaunch a manually-run profile gateway after its current PID exits."""
-    return old_pid > 0 and _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile))
+    if old_pid <= 0:
+        return False
+    from hermes_cli.profile_action_env import profile_action_environment
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        target_home = Path(resolve_profile_env(profile))
+    except (ValueError, FileNotFoundError):
+        return False
+    env = profile_action_environment(target_home)
+    return _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile), env=env)
 
 
-def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
+def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, env: dict[str, str] | None = None) -> bool:
     """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits. Watcher and respawn
     both need platform-appropriate detach: POSIX setsid; on Windows ``start_new_session`` does NOT detach
     (the watcher would die with the CLI console), so ``windows_detach_popen_kwargs()`` supplies flags."""
@@ -1016,6 +1059,8 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             # Fall back to the original argv: a visible window beats a failed respawn.
             respawn_cwd = ""
             respawn_env_overlay = {}
+    if env is not None and "HERMES_HOME" in env:
+        respawn_env_overlay["HERMES_HOME"] = env["HERMES_HOME"]
 
     # cwd/env overlay are embedded as JSON literals in the watcher source (no extra argv plumbing).
     watcher = textwrap.dedent(
@@ -1098,7 +1143,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     devnull = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     # Same detach for the watcher itself, so closing the terminal doesn't kill it.
     try:
-        subprocess.Popen(watcher_argv, **devnull, **windows_detach_popen_kwargs())
+        subprocess.Popen(watcher_argv, env=env, **devnull, **windows_detach_popen_kwargs())
     except OSError:
         # Parent job object rejected CREATE_BREAKAWAY_FROM_JOB; retry without it (Windows only —
         # ``start_new_session=True`` cannot raise OSError on POSIX).
@@ -1107,7 +1152,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             else {"start_new_session": True}
         )
         try:
-            subprocess.Popen(watcher_argv, **devnull, **fallback_kwargs)
+            subprocess.Popen(watcher_argv, env=env, **devnull, **fallback_kwargs)
         except OSError:
             return False
     return True
