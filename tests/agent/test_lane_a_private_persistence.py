@@ -114,15 +114,17 @@ def test_actual_sqlite_flush_and_trajectory_fences(mode, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("mode", ["public", "agent", "context", "both", "error"])
 def test_text_response_flush_is_fenced_at_extracted_path(mode, monkeypatch):
-    from agent import turn_final_response
+    from agent import turn_final_response, turn_finalizer
 
     agent = SimpleNamespace(
         _has_content_after_think_block=lambda text: bool(text),
         _emit_pending_fallback_notice=Mock(), _clear_status_buffer=Mock(),
         _stall_guards=False, valid_tool_names=[], _strip_think_blocks=lambda text: text,
         _build_assistant_message=lambda msg, reason: {"role": "assistant", "content": msg.content},
-        _flush_messages_to_session_db=Mock(), quiet_mode=True,
+        _flush_messages_to_session_db=Mock(), quiet_mode=True, session_id="lane-a", model="test",
     )
+    output_hooks = Mock(return_value=[])
+    monkeypatch.setattr(turn_finalizer, "_invoke_hook_safely", output_hooks)
     monkeypatch.setattr("agent.agent_runtime_helpers.intent_ack_continuation_mode", lambda agent: "off")
     monkeypatch.setattr(turn_final_response, "apply_stop_gates", lambda *a, **k: SimpleNamespace(
         pending_verification_response=None, pending_verification_response_previewed=False, continue_turn=False,
@@ -143,8 +145,10 @@ def test_text_response_flush_is_fenced_at_extracted_path(mode, monkeypatch):
     assert verdict.active_system_prompt == "stable"
     if mode == "public":
         agent._flush_messages_to_session_db.assert_called_once()
+        assert [call.args[0] for call in output_hooks.call_args_list] == ["transform_llm_output"]
     else:
         agent._flush_messages_to_session_db.assert_not_called()
+        output_hooks.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", ["public", "agent", "context", "both", "error"])

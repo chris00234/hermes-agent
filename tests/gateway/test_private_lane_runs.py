@@ -711,6 +711,7 @@ class TestEgressGating:
                 def _run(user_message=None, conversation_history=None, task_id=None):
                     kw = create.call_args.kwargs
                     kw["stream_delta_callback"]("SECRET-DELTA")
+                    kw["interim_assistant_callback"]("SECRET-INTERIM", already_streamed=False)
                     cb = kw["tool_progress_callback"]
                     cb("reasoning.available", preview="SECRET-REASONING")
                     cb("tool.started", tool_name="bash", preview="SECRET-ARGS")
@@ -720,7 +721,7 @@ class TestEgressGating:
                         duration=0.1,
                         is_error=False,
                     )
-                    return {"final_response": "PRIVATE-OUTPUT"}
+                    return {"final_response": "PRIVATE-OUTPUT", "pending_steer": "SECRET-STEER"}
 
                 agent = _done_agent()
                 agent.run_conversation.side_effect = _run
@@ -742,6 +743,9 @@ class TestEgressGating:
         assert "run.completed" in body
         assert "PRIVATE-OUTPUT" in body
         assert "SECRET-DELTA" not in body
+        assert "SECRET-INTERIM" not in body
+        assert "message.interim" not in body
+        assert "SECRET-STEER" not in body
         assert "SECRET-REASONING" not in body
         assert "reasoning.available" not in body
         assert "SECRET-ARGS" not in body

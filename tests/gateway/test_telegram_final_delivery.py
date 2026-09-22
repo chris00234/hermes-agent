@@ -276,13 +276,18 @@ async def test_long_edit_flood_blocks_stream_and_final_sends_until_deadline(monk
     consumer._already_sent = True
 
     assert not await consumer._send_or_edit("Partial completed answer", finalize=True, is_turn_final=True)
-    assert consumer._current_edit_interval == 185.0
     await consumer._send_fallback_final("Partial completed answer")
     assert not consumer.final_content_delivered
     adapter._bot.edit_message_text.assert_awaited_once()  # no Markdown-to-plain flood retry
     adapter._bot.send_message.assert_not_awaited()
 
-    now[0] += 184.0
+    # Even after the consumer's bounded backoff expires, the adapter retains Telegram's full deadline.
+    now[0] += 31.0
+    blocked_edit = await adapter.edit_message("123", "456", "Partial completed answer")
+    assert not blocked_edit.success
+    adapter._bot.edit_message_text.assert_awaited_once()
+
+    now[0] += 153.0
     result = await adapter.send("123", "Partial completed answer", metadata={"notify": True})
     assert not result.success and result.retry_after == 1.0
     adapter._bot.send_message.assert_not_awaited()
