@@ -225,3 +225,19 @@ def test_private_status_projection_preserves_hydrated_digest():
     projected = runs._project_private_run_status({"run_id": "run-digest", "output": "private"})
     assert projected["output_digest"]
     assert runs._project_private_run_status(projected) == projected
+
+
+@pytest.mark.parametrize("private", [True, False])
+def test_only_public_run_returns_memory_manager_to_session_cache(private):
+    from unittest.mock import Mock
+
+    adapter = _make_adapter()
+    agent = _done_agent()
+    adapter._memory_sessions.checkin = Mock()
+    runs._run_agent_sync(
+        adapter, _launch(adapter, _policy() if private else None), agent,
+        lambda _: None, _api_server=api)
+    if private:
+        adapter._memory_sessions.checkin.assert_not_called()
+    else:
+        adapter._memory_sessions.checkin.assert_called_once_with(agent)

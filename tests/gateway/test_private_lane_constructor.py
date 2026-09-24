@@ -5,6 +5,8 @@ fence), §4 bind point 1 (middleware default-deny seed). No live generation,
 no live ports.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
@@ -80,12 +82,15 @@ class TestConstructorFence:
         captured, observed = {}, {}
         adapter, session_db_calls = _prepare_create_agent(monkeypatch, captured, observed)
         policy = _policy()
+        adapter._memory_sessions.checkout = MagicMock(side_effect=AssertionError("private memory checkout"))
 
         agent = adapter._create_agent(session_id="run-1", private_execution_policy=policy)
 
         assert captured["session_db"] is None
         assert session_db_calls == []
         assert captured["skip_memory"] is True
+        assert captured["memory_manager"] is None
+        adapter._memory_sessions.checkout.assert_not_called()
         assert captured["skip_background_review"] is True
         assert captured["save_trajectories"] is False
         assert captured["checkpoints_enabled"] is False

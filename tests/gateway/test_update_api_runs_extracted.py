@@ -87,7 +87,7 @@ def test_actual_executor_body_resets_policy_and_session_on_reuse(cleanup_fails):
     policy = build_policy(
         run_id="run-lane-b", profile="default", execution_attempt_id="lane-b",
         lease_expires_at="2099-01-01T00:00:00+00:00", allowed_toolsets=("shell",))
-    adapter = SimpleNamespace(_profile_scope=lambda _: nullcontext(), _bind_api_server_session=_bind_session)
+    adapter = SimpleNamespace(_profile_scope=lambda _: nullcontext(), _bind_api_server_session=_bind_session, _memory_sessions=Mock())
     seen = []
 
     def converse(**kwargs):
