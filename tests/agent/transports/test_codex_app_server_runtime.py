@@ -378,6 +378,10 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+        approved = {p.split(".")[3] for p in cmd if p.endswith('.approval_mode="approve"')}
+        assert approved == set(cas._KANBAN_WORKER_APPROVED_TOOLS)
+        assert all(t.startswith("kanban_") for t in approved)
+        assert "kanban_create" not in approved
 
 
 class TestSpawnEnvSecretStripping:

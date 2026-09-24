@@ -48,6 +48,11 @@ class CodexAppServerTransportError(CodexAppServerError):
 
 
 _TRANSPORT_LOST_CODE = -32000
+# Board-scoped handoff tools (they act only on HERMES_KANBAN_TASK); orchestrator tools stay gated.
+_KANBAN_WORKER_APPROVED_TOOLS = (
+    "kanban_show", "kanban_list", "kanban_heartbeat", "kanban_comment", "kanban_complete",
+    "kanban_block", "kanban_request_review", "kanban_request_changes",
+)
 
 
 def _snapshot_descendants(pid: int) -> list[Any]:
@@ -139,6 +144,10 @@ class CodexAppServerClient:
                 "-c", f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                 "-c", "sandbox_workspace_write.network_access=false",
             ]
+            # Unattended workers run with approval_policy=never, which rejects every MCP call
+            # unless the tool is pre-approved; approve only the board handoff tools.
+            for tool in _KANBAN_WORKER_APPROVED_TOOLS:
+                cmd += ["-c", f'mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.tools.{tool}.approval_mode="approve"']
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
