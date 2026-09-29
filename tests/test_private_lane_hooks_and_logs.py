@@ -281,6 +281,26 @@ class TestPrivateLogFilter:
         assert "PUBLIC-MARK-def456" in agent_log
         assert "PUBLIC-ERR-def456" in errors_log
 
+    def test_gateway_stderr_handler_drops_private_records(
+        self, hermes_home, monkeypatch, capsys
+    ):
+        # launchd captures gateway stderr into gateway.error.log - one file
+        # for every served profile under multiplex.
+        from gateway import run as gateway_run
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(
+            "tools.skills_sync.sync_skills", lambda quiet=True: None
+        )
+        gateway_run._start_gateway_configure_logging(0)
+        lg = logging.getLogger("gateway.run")
+        with _bound_policy():
+            lg.warning("PRIVATE-STDERR-abc123")
+        lg.warning("PUBLIC-STDERR-def456")
+        err = capsys.readouterr().err
+        assert "PRIVATE-STDERR-abc123" not in err
+        assert "PUBLIC-STDERR-def456" in err
+
     def test_factory_stamps_marker_before_queue_hop(self):
         factory = logging.getLogRecordFactory()
         with _bound_policy():

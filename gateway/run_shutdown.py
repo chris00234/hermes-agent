@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import Context
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -1175,7 +1176,9 @@ class GatewayShutdownMixin:
         from tools.clarify_gateway import clear_session as clear_clarify
 
         for session_key, agent in active_agents.items():
-            clear_clarify(session_key, reason="shutdown")
+            # Shutdown runs unscoped: close pending clarify evidence under the OWNING profile so its
+            # plugins, not the launch profile's, receive prompt_closed.
+            self._run_release_in_profile_scope(partial(clear_clarify, reason="shutdown"), (session_key,), session_key)
             self._flush_agent_transcript_at_shutdown(agent)
             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
             # (e.g. a full-session trace export) — same hang class as the memory provider below.

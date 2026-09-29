@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from contextlib import nullcontext, suppress
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -806,7 +807,9 @@ class GatewayAgentCacheMixin:
             return
         from tools.clarify_gateway import clear_session as clear_clarify
 
-        clear_clarify(session_key, reason="evicted")
+        # The caller may hold another profile's scope (e.g. /login's free-tier sweep): close pending
+        # clarify evidence under the OWNING profile so its plugins receive prompt_closed.
+        self._run_release_in_profile_scope(partial(clear_clarify, reason="evicted"), (session_key,), session_key)
         self._spawn_release_thread(
             self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
             session_key=session_key,

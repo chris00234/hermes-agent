@@ -5247,7 +5247,7 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
     _best_effort(_sync_skills)
 
     # Centralized logging (agent.log INFO+, errors.log WARNING+, gateway.log gateway-only); idempotent.
-    from hermes_logging import setup_logging, _safe_stderr
+    from hermes_logging import setup_logging, _safe_stderr, _PrivateRecordFilter
     setup_logging(hermes_home=_hermes_home, mode="gateway")
 
     def _security_audit() -> None:
@@ -5268,6 +5268,9 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
         _stderr_handler = logging.StreamHandler(_safe_stderr())
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(_gateway_stderr_formatter())
+        # launchd captures stderr into gateway.error.log (one file for every served profile under
+        # multiplex): drop private-lane records like every hermes_logging handler (DE_DESIGN §1.1 #19).
+        _stderr_handler.addFilter(_PrivateRecordFilter())
         root = logging.getLogger()
         root.addHandler(_stderr_handler)
         if _stderr_level < root.level:  # so DEBUG records can reach the handler
