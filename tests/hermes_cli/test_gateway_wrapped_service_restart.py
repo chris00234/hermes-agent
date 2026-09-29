@@ -12,7 +12,7 @@ import pytest
 from hermes_cli import gateway as gw
 
 
-pytestmark = [pytest.mark.macos_only, pytest.mark.spawns_gateway_lookalike]
+pytestmark = [pytest.mark.platforms("macos"), pytest.mark.spawns_gateway_lookalike]
 
 
 @pytest.fixture
@@ -93,6 +93,29 @@ def test_exited_descendant_never_redirects_drain_to_legacy_wrapper(monkeypatch):
     monkeypatch.setattr(psutil, "Process", lambda _: wrapper)
     monkeypatch.setattr(gw.os, "kill", lambda *_: pytest.fail("must not signal the wrapper"))
     assert not gw._graceful_restart_via_sigusr1(4242, 3)
+
+
+def test_store_launcher_wrapper_is_not_mistaken_for_its_gateway(monkeypatch):
+    """Store launchers run the timestamp wrapper as ``python -I -c <bootstrap>``; under the
+    osascript job only its gateway child may be drained."""
+    import psutil
+    from hermes_cli._launchers import runtime_command
+
+    gateway_argv = runtime_command(gw.PROJECT_ROOT, ["gateway", "run"], python=sys.executable)
+    wrapper_argv = runtime_command(
+        gw.PROJECT_ROOT, ["--error-log", "gateway.error.log", "--", *gateway_argv],
+        module="hermes_cli.stderr_timestamp", python=sys.executable,
+    )
+    children = [
+        SimpleNamespace(pid=4243, cmdline=lambda: wrapper_argv),
+        SimpleNamespace(pid=4244, cmdline=lambda: gateway_argv),
+    ]
+    osascript = SimpleNamespace(
+        cmdline=lambda: ["/usr/bin/osascript", "-l", "JavaScript", "-e", "system()"],
+        children=lambda **_: children,
+    )
+    monkeypatch.setattr(psutil, "Process", lambda _: osascript)
+    assert gw.gateway_pid_for_service(4242) == 4244
 
 
 def test_manual_sweep_does_not_restart_a_new_service_child(legacy_service, monkeypatch):

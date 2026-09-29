@@ -704,14 +704,17 @@ class MemoryManager:
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
             result = provider.handle_tool_call(tool_name, args, **kwargs)
-            if self._memory_lifecycle.read_generation() != generation:
-                return tool_error("Memory provider session changed during this call")
-            return result
         except Exception as e:
             logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
+            record_provider_memory_call(provider.name, tool_name, args, raised=True)
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+        record_provider_memory_call(provider.name, tool_name, args, result)
+        if self._memory_lifecycle.read_generation() != generation:
+            return tool_error("Memory provider session changed during this call")
+        return result
 
     # -- Lifecycle hooks -----------------------------------------------------
 
@@ -888,9 +891,8 @@ class MemoryManager:
             if version is None:
                 version = _LEGACY_PRE_COMPRESS_API_VERSION
             is_checkpoint_provider = version >= checkpoint_api_version
-            provider_messages = messages
-            if is_checkpoint_provider and evidence_messages is not None:
-                provider_messages = evidence_messages
+            use_evidence = is_checkpoint_provider and evidence_messages is not None
+            provider_messages = evidence_messages if use_evidence else messages
             kwargs: Dict[str, Any] = {}
             # v1 providers and bare-shape v2 providers never see the signal.
             if is_checkpoint_provider and _accepts_require_checkpoint(provider.on_pre_compress):

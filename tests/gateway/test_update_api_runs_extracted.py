@@ -72,8 +72,9 @@ def _launch(adapter, policy):
     return runs._RunLaunch(
         owner=adapter, run_id="run-lane-b", queue=asyncio.Queue(), session_id="run-lane-b",
         gateway_session_key=None, declared_selected=False, user_message="synthetic private test",
-        conversation_history=[], agent_kwargs={"room_dispatch": None}, request_profile=None,
-        browser_control_principal=None, browser_control_transport_family=None, private_policy=policy)
+        conversation_history=[], session_history_delivery=False, agent_kwargs={"room_dispatch": None},
+        request_profile=None, browser_control_principal=None, browser_control_transport_family=None,
+        private_policy=policy)
 
 
 def _bind_session(**kwargs):

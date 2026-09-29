@@ -104,6 +104,29 @@ async def test_actual_sdk_callback_closes_exact_choice_without_speech(callback_l
 
 
 @pytest.mark.asyncio
+async def test_localized_other_button_keeps_v2_callback_evidence(callback_lane, monkeypatch):
+    from agent import i18n
+
+    adapter, _, entry, events, _ = callback_lane
+    monkeypatch.setenv("HERMES_LANGUAGE", "ko")
+    i18n.reset_language_cache()
+    assert (await _send(adapter)).success
+    keyboard = adapter._bot.send_message.call_args.kwargs["reply_markup"].to_dict()
+    other = keyboard["inline_keyboard"][-1][0]["text"]
+    assert other == i18n.t("platform.telegram.prompt.other", lang="ko")
+    assert other != i18n.t("platform.telegram.prompt.other", lang="en")
+    await _tap(adapter)
+    assert entry.response == "B"
+    assert [event["kind"] for event in events] == [
+        "prompt_delivered",
+        "original_callback",
+        "prompt_closed",
+    ]
+    assert {event["schema_version"] for event in events} == {2}
+    assert events[2]["selected_callback_query_id"] == "tap-1"
+
+
+@pytest.mark.asyncio
 async def test_actual_v2_prompt_still_accepts_original_text(callback_lane):
     adapter, runner, _, events, received = callback_lane
     await _send(adapter)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from agent.i18n import t
 from gateway.telegram_clarify_evidence import _identity, _route, _unmodified
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ def delivered_keyboard(message, sent_markup, clarify_id, choices):
         for index in range(len(choices))
     ]
     expected.append([
-        {"text": "✏️ Other (type answer)", "callback_data": f"cl:{clarify_id}:other"}
+        {"text": t("platform.telegram.prompt.other"), "callback_data": f"cl:{clarify_id}:other"}
     ])
     if snapshot["keyboard"] != {"inline_keyboard": expected} or any(
         len(row[0]["callback_data"].encode("utf-8")) > 64 for row in expected

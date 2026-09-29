@@ -475,10 +475,10 @@ def migrate(
         translated[HERMES_TOOLS_MCP_SERVER_NAME] = _build_hermes_tools_mcp_entry()
         if HERMES_TOOLS_MCP_SERVER_NAME not in report.migrated:
             report.migrated.append(HERMES_TOOLS_MCP_SERVER_NAME)
-    existing = without_managed = ""
+    without_managed = ""
     if target.exists():
         try:
-            existing = target.read_text(encoding="utf-8")
+            existing = target.read_text(encoding="utf-8-sig")
         except Exception as exc:
             report.errors.append(f"could not read {target}: {exc}")
             return report
@@ -491,42 +491,42 @@ def migrate(
                     "; existing config.toml was unloadable — re-run `hermes codex-runtime migrate` "
                     "to migrate plugins")
         without_managed = _strip_existing_managed_block(existing)
-    try:
-        unmanaged = tomllib.loads(without_managed)
-    except tomllib.TOMLDecodeError as exc:
-        report.errors.append(f"invalid unmanaged TOML in {target}: {exc}")
-        return report
-    try:
-        native = tomllib.loads(existing)
-    except tomllib.TOMLDecodeError as exc:
-        report.errors.append(f"invalid existing TOML in {target}: {exc}")
-        return report
-    # Permission settings belong to the user even when an older migration emitted them.
-    restored = "".join(
-        f"{key} = {_format_toml_value(native[key])}\n"
-        for key in _NATIVE_PERMISSION_KEYS if key in native and key not in unmanaged)
-    if restored:
-        without_managed = _insert_managed_block_at_top_level(without_managed, restored)
-    if any(key in native for key in _NATIVE_PERMISSION_KEYS):
-        default_permission_profile = None
-    if default_permission_profile:
-        report.wrote_permissions_default = default_permission_profile
-    user_servers = unmanaged.get("mcp_servers", {})
-    if isinstance(user_servers, dict):
-        # User-owned entries include identity and approval fields we must not translate away.
-        for name in sorted(set(user_servers) & set(translated)):
+        try:
+            unmanaged = tomllib.loads(without_managed)
+        except tomllib.TOMLDecodeError as exc:
+            report.errors.append(f"invalid unmanaged TOML in {target}: {exc}")
+            return report
+        try:
+            native = tomllib.loads(existing)
+        except tomllib.TOMLDecodeError as exc:
+            report.errors.append(f"invalid existing TOML in {target}: {exc}")
+            return report
+        # Permission settings belong to the user even when an older migration emitted them.
+        restored = "".join(
+            f"{key} = {_format_toml_value(native[key])}\n"
+            for key in _NATIVE_PERMISSION_KEYS if key in native and key not in unmanaged)
+        if restored:
+            without_managed = _insert_managed_block_at_top_level(without_managed, restored)
+        if any(key in native for key in _NATIVE_PERMISSION_KEYS):
+            default_permission_profile = None
+        if plugin_query_succeeded:
+            without_managed = _strip_unmanaged_plugin_tables(without_managed)
+        # Preserve-user policy: a name the user already declares outside the managed block is
+        # theirs; skip our projection for it instead of emitting a duplicate table header.
+        for name in sorted(_unmanaged_mcp_server_names(without_managed) & set(translated)):
             del translated[name]
             report.migrated.remove(name)
             report.preserved_user_servers.append(name)
-    if plugin_query_succeeded:
-        without_managed = _strip_unmanaged_plugin_tables(without_managed)
+    if default_permission_profile:
+        report.wrote_permissions_default = default_permission_profile
     managed_block = render_codex_toml_section(
         translated, plugins=plugins, default_permission_profile=default_permission_profile)
     new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
     try:
         tomllib.loads(new_text)
     except tomllib.TOMLDecodeError as exc:
-        report.errors.append(f"invalid generated TOML for {target}: {exc}")
+        # Never replace a loadable config.toml with one codex would refuse to start on.
+        report.errors.append(f"refusing to write {target}: rendered config is not valid TOML ({exc})")
         return report
     if dry_run:
         return report

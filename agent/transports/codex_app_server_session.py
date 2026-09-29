@@ -453,7 +453,7 @@ class CodexAppServerSession:
     def run_turn(
         self, user_input: Any, *, turn_timeout: Optional[float] = 600.0,
         model: Optional[str] = None, reasoning_effort: Optional[str] = None,
-        notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: Optional[float] = None,
+        notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
@@ -492,7 +492,7 @@ class CodexAppServerSession:
 
     def _run_started_turn(
         self, result: TurnResult, ts: dict, turn_timeout: Optional[float], notification_poll_timeout: float,
-        post_tool_quiet_timeout: Optional[float],
+        post_tool_quiet_timeout: float,
     ) -> None:
         """Drive an accepted ``turn/start`` to completion: quiet warning, approvals, projection."""
         projector = CodexEventProjector()
@@ -506,8 +506,6 @@ class CodexAppServerSession:
 
         def warn_if_quiet() -> bool:
             nonlocal last_tool_completion_at
-            if post_tool_quiet_timeout is None:
-                return False
             if last_tool_completion_at is None or (time.monotonic() - last_tool_completion_at) <= post_tool_quiet_timeout:
                 return False
             last_tool_completion_at = None

@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -134,6 +135,54 @@ def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., st
     preview = redact_sensitive_text(text, force=True)
     limit = _TOOL_COMPLETED_PREVIEW_MAX_CHARS
     return preview if len(preview) <= limit else preview[: limit - 3] + "..."
+
+
+_RUN_STREAM_SUBSCRIBER_OVERFLOW = object()
+_RUN_STREAM_WRITE_TIMEOUT = 5.0
+
+
+class _RunStream:
+    """Sequence and retain one run's events while fanning out to SSE clients."""
+
+    BACKLOG_LIMIT = 1000
+    SUBSCRIBER_QUEUE_LIMIT = 256
+
+    def __init__(self) -> None:
+        self.subscribers: set[asyncio.Queue] = set()
+        self.backlog: deque[tuple[int, Optional[Dict[str, Any]]]] = deque(
+            maxlen=self.BACKLOG_LIMIT
+        )
+        self.next_seq = 0
+        self.terminal = False
+
+    def put_nowait(self, event: Optional[Dict[str, Any]]) -> None:
+        if self.terminal:
+            return
+        seq = self.next_seq
+        self.next_seq += 1
+        self.backlog.append((seq, event))
+        if event is None:
+            self.terminal = True
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait((seq, event))
+            except asyncio.QueueFull:
+                self.detach(queue)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait((seq, _RUN_STREAM_SUBSCRIBER_OVERFLOW))
+
+    def attach(
+        self, last_seq: int = -1
+    ) -> tuple[asyncio.Queue, list[tuple[int, Optional[Dict[str, Any]]]]]:
+        replay = [(seq, event) for seq, event in self.backlog if seq > last_seq]
+        # Headroom for events produced while the replay is still being written.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self.SUBSCRIBER_QUEUE_LIMIT + len(replay))
+        self.subscribers.add(queue)
+        return queue, replay
+
+    def detach(self, queue: asyncio.Queue) -> None:
+        self.subscribers.discard(queue)
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -438,7 +487,6 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # outlive the request, hence the separate stopping set), pollable statuses, and
     # approval session keys (approval core resolves by session key, clients by run_id).
     self._run_idempotency_ids: set[str] = set()
-    self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     self._private_run_ids: set[str] = set()
     self._shutdown_interrupted_run_ids: set[str] = set()
@@ -734,22 +782,22 @@ class _RunLaunch:
 
     owner: Any
     run_id: str
-    queue: "asyncio.Queue[Optional[Dict]]"
+    queue: _RunStream
     session_id: str
     gateway_session_key: Optional[str]
     declared_selected: bool
     user_message: str
     conversation_history: List[Dict[str, str]]
+    # #98619: only continuation paths that reload session history may grant wake authority —
+    # a previous_response_id continuation consumes its ResponseStore snapshot instead, and a
+    # caller-supplied conversation_history is authoritative for the turn; neither consumes a
+    # SessionDB delivery row, so both stay default-denied.
+    session_history_delivery: bool
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
     private_policy: Optional[PrivateExecutionPolicy] = None
-    # #98619: only continuation paths that reload session history may grant wake authority —
-    # a previous_response_id continuation consumes its ResponseStore snapshot instead, and a
-    # caller-supplied conversation_history is authoritative for the turn; neither consumes a
-    # SessionDB delivery row, so both stay default-denied.
-    session_history_delivery: bool = False
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -777,7 +825,12 @@ def _retire_live_run(self, run_id: str) -> None:
 
 
 def _drop_run_transport(self, run_id: str) -> None:
-    _forget_run(self, run_id, self._run_streams, self._run_streams_created)
+    _forget_run(
+        self,
+        run_id,
+        self._run_streams,
+        self._run_streams_created,
+    )
 
 
 async def _resolve_live_session_id(self, session_id: str) -> str:
@@ -1002,7 +1055,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     session_history_delivery = private_policy is None and not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    q = self._run_streams[run_id] = asyncio.Queue()
+    q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
@@ -1021,7 +1074,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         self._run_idempotency_ids.add(run_id)
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
-        conversation_history, session_history_delivery=session_history_delivery,
+        conversation_history, session_history_delivery,
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
@@ -1157,18 +1210,12 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
-        event = dict(approval_data or {})
-        # Clients must never receive the raw flagged command: redact before it hits the stream.
-        # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
-        # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
-        # flagged. Reuse the gateway seam.
-        if "command" in event:
-            from gateway.run import _redact_approval_command
-            event["command"] = _redact_approval_command(event.get("command"))
-        event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
-            smart_denied=bool(event.get("smart_denied")),
-            allow_session=run.private_policy is None and event.get("allow_session") is not False,
-            allow_permanent=run.private_policy is None and event.get("allow_permanent") is not False)))
+        # Clients must never receive the raw flagged command (#48456): the shared builder redacts.
+        event = _api_server._approval_request_event(run_id, approval_data)
+        if run.private_policy is not None:
+            # Private runs resolve only once/deny (see _handle_run_approval).
+            event["choices"] = _api_server._approval_event_choices(
+                smart_denied=bool(event.get("smart_denied")), allow_session=False, allow_permanent=False)
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
             loop.call_soon_threadsafe(q.put_nowait, event)
@@ -1231,6 +1278,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    _run_started_at = time.perf_counter()
 
     def _text_cb(delta: Optional[str]) -> None:
         if run.private_policy is not None or delta is None or run_id not in self._run_streams:
@@ -1257,7 +1305,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             extra = {}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
         with suppress(Exception):
-            run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
+            # A worker can finish before its Future is wrapped, so awaiting it
+            # need not yield to already-scheduled commentary/tool callbacks.
+            loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **fields, **extra))
 
     private_token = bind_private_policy(run.private_policy)
     try:
@@ -1284,6 +1334,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             result, usage, served_runtime = await _await_private_worker(self, run, agent, worker, _api_server=_api_server)
         else:
             result, usage, served_runtime = await worker
+        # Publish request metrics (daily counters + latency) with each completed run (#52323).
+        self._record_api_metrics(usage, time.perf_counter() - _run_started_at)
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
@@ -1334,7 +1386,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         try:
             _unregister_approval_notify(run.approval_session_key)
             with suppress(Exception):
-                run.put_event(None)  # sentinel: close the SSE stream
+                loop.call_soon(run.put_event, None)  # close after the queued events
             _retire_live_run(self, run_id)
         finally:
             reset_private_policy(private_token)
@@ -1471,28 +1523,76 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         await asyncio.sleep(0.05)
     else:
         return _run_not_found(_api_server._openai_error, run_id)
-    q = self._run_streams[run_id]
-    self._run_stream_subscribers.add(run_id)
-    response = web.StreamResponse(status=200, headers={
-        "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    await response.prepare(request)
+    stream = self._run_streams[run_id]
+    raw_last_seq = request.headers.get("Last-Event-ID") or request.query.get("last_seq")
     try:
+        last_seq = max(-1, int(str(raw_last_seq).strip())) if raw_last_seq is not None else -1
+    except (TypeError, ValueError):
+        last_seq = -1
+    q, replay = stream.attach(last_seq)
+    response = web.StreamResponse(status=200, headers=self._sse_headers(request))
+
+    async def _write(data: bytes) -> None:
+        try:
+            async with asyncio.timeout(_RUN_STREAM_WRITE_TIMEOUT):
+                await response.write(data)
+        except TimeoutError:
+            with suppress(Exception):
+                response.force_close()
+            raise
+
+    async def _write_event(seq: int, event: Dict[str, Any]) -> None:
+        payload = dict(event)
+        payload["seq"] = seq
+        await _write(_api_server._sse_frame(payload, id=seq))
+
+    prepared = False
+    try:
+        await response.prepare(request)
+        prepared = True
+        # Flush the response head before waiting on the queue: aiohttp holds the headers
+        # until the first body write, so a subscriber that connects before the run's first
+        # event (e.g. before `approval.request`) sees no bytes and fetch()/EventSource never
+        # resolve. A comment frame is ignored by every conforming SSE consumer.
+        await _write(b": open\n\n")
+        if replay and replay[0][0] > last_seq + 1:
+            truncation = _run_event(
+                run_id,
+                "replay.truncated",
+                oldest_retained_seq=replay[0][0],
+            )
+            if raw_last_seq is not None:
+                truncation["requested_seq"] = last_seq
+            await _write(_api_server._sse_frame(truncation))
+        for seq, event in replay:
+            if event is None:
+                await _write(b": stream closed\n\n")
+                return response
+            await _write_event(seq, event)
+        if stream.terminal and q.empty():
+            await _write(b": stream closed\n\n")
+            return response
         while True:
             try:
-                event = await asyncio.wait_for(
+                seq, event = await asyncio.wait_for(
                     q.get(), timeout=_api_server.CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
             except asyncio.TimeoutError:
-                await response.write(b": keepalive\n\n")
+                await _write(b": keepalive\n\n")
                 continue
-            if event is None:  # run finished
-                await response.write(b": stream closed\n\n")
+            if event is _RUN_STREAM_SUBSCRIBER_OVERFLOW:
+                logger.debug("[api_server] closing slow SSE subscriber for run %s", run_id)
                 break
-            await response.write(_api_server._sse_frame(event))
+            if event is None:  # run finished
+                await _write(b": stream closed\n\n")
+                break
+            await _write_event(seq, event)
     except Exception as exc:
+        if not prepared:
+            raise
         logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
     finally:
-        self._run_stream_subscribers.discard(run_id)
-        _drop_run_transport(self, run_id)
+        stream.detach(q)
+        self._release_run_owner_if_forgotten(run_id)
     return response
 
 
@@ -1645,7 +1745,8 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     if now is None:
         now = time.time()
     for run_id, created_at in list(self._run_streams_created.items()):
-        if now - created_at <= self._RUN_STREAM_TTL or run_id in self._run_stream_subscribers:
+        stream = self._run_streams.get(run_id)
+        if now - created_at <= self._RUN_STREAM_TTL or (stream is not None and stream.subscribers):
             continue
         logger.debug("[api_server] sweeping expired run transport %s", run_id)
         task = self._active_run_tasks.get(run_id)

@@ -31,7 +31,7 @@ def test_restart_watcher_keeps_profile_environment_isolated(tmp_path, monkeypatc
     monkeypatch.setenv("CUSTOM_DEPLOYMENT_SECRET", "source-only")
     monkeypatch.setenv("ROOT_DEPLOYMENT_SECRET", "root-only")
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
-    assert gw._gateway_run_args_for_profile("default")[3:5] == ["--profile", "default"]
+    assert gw._gateway_run_args_for_profile("default")[-5:] == ["--profile", "default", "gateway", "run", "--replace"]
 
     real_popen = subprocess.Popen
     watchers = []

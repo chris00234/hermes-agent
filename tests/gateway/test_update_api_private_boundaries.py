@@ -107,13 +107,8 @@ async def test_extracted_workers_isolate_concurrent_private_and_public_runs():
     assert any(event.get("preview") == "public-preview" for event in public_events)
 
 
-def _drain(queue):
-    events = []
-    while not queue.empty():
-        event = queue.get_nowait()
-        if event is not None:
-            events.append(event)
-    return events
+def _drain(stream):
+    return [event for _seq, event in stream.backlog if event is not None]
 
 
 @pytest.mark.asyncio
@@ -160,8 +155,9 @@ def _launch(adapter, policy):
     return runs._RunLaunch(
         owner=adapter, run_id="run-context", queue=asyncio.Queue(), session_id="run-context",
         gateway_session_key=None, declared_selected=False, user_message="private",
-        conversation_history=[], agent_kwargs={"room_dispatch": None}, request_profile=None,
-        browser_control_principal=None, browser_control_transport_family=None, private_policy=policy)
+        conversation_history=[], session_history_delivery=False, agent_kwargs={"room_dispatch": None},
+        request_profile=None, browser_control_principal=None, browser_control_transport_family=None,
+        private_policy=policy)
 
 
 def _policy():

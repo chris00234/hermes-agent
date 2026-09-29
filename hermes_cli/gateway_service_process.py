@@ -4,6 +4,10 @@ from pathlib import Path
 
 
 def _is_service_wrapper(argv: list[str]) -> bool:
+    from gateway.status import inline_bootstrap_argv
+
+    # Store launchers run the wrapper module through an inline bootstrap (``python -I -c <src> …``).
+    argv = inline_bootstrap_argv(argv) or argv
     return bool(argv) and (
         Path(argv[0]).name == "osascript"
         or argv[1:3] == ["-m", "hermes_cli.stderr_timestamp"]

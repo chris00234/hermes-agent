@@ -32,7 +32,7 @@ def config_home(tmp_path, monkeypatch):
 
 
 def _write_config(home, **top_level):
-    import yaml
+    import hermes_yaml as yaml
     cfg = {"model": "old-model", "custom_providers": []}
     cfg.update(top_level)
     (home / "config.yaml").write_text(yaml.safe_dump(cfg))
@@ -127,7 +127,11 @@ def test_inventory_exclusions_survive_setup_and_virtual_rows(
 
     other_home = tmp_path / "other"
     other_home.mkdir()
-    config = {"model": {"provider": current_provider, "default": "saved-model"}}
+    config = {
+        "model": {"provider": current_provider, "default": "saved-model"},
+        # MoA is opt-in: an enabled preset keeps its virtual row visible unless excluded.
+        "moa": {"presets": {"default": {"enabled": True}}},
+    }
     _write_config(config_home, **config, model_catalog={"excluded_providers": [" CLAUDE ", " MoA "]})
     _write_config(other_home, **config)
     # No credentials: the current row comes from recovery and all others from setup.
@@ -158,7 +162,7 @@ def test_inventory_exclusions_survive_setup_and_virtual_rows(
 def test_gateway_picker_cannot_reintroduce_excluded_moa(config_home, monkeypatch, current_provider):
     from hermes_cli.model_switch_providers import list_picker_providers
 
-    _write_config(config_home)
+    _write_config(config_home, moa={"presets": {"default": {"enabled": True}}})
     monkeypatch.setattr("hermes_cli.model_switch.list_authenticated_providers", lambda **kw: [])
     for excluded in ([], [" MoA "], []):
         rows = list_picker_providers(

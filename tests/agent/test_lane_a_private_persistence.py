@@ -138,6 +138,7 @@ def test_text_response_flush_is_fenced_at_extracted_path(mode, monkeypatch):
             final_response=None, _turn_exit_reason="unknown", _preflight_compression_blocked=False,
             codex_ack_continuations=0, truncated_response_parts=[], length_continue_retries=0,
             _pending_verification_response=None, _pending_verification_response_previewed=False,
+            effective_task_id="lane-a-task",
         )
     assert verdict.action == "break"
     assert verdict.final_response == "Answer."

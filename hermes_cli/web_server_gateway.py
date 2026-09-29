@@ -4,7 +4,6 @@ subprocess spawning, gateway restart plumbing, system platform display.
 
 import logging
 import json
-import os
 import re
 import subprocess
 import sys
@@ -306,38 +305,6 @@ def _terminate_desktop_managed_gateway() -> None:
         pass  # exited between poll() and terminate()
 
 
-def _dashboard_spawn_executable() -> str:
-    """Interpreter for detached dashboard actions: the install's venv python when it differs
-    from ``sys.executable``, else ``sys.executable``.
-
-    Under an SSH remote backend the server runs on the uv BASE interpreter with the venv's
-    site-packages injected into sys.path at startup, so ``sys.executable`` is dependency-less and
-    a detached child dies on its first third-party import; the venv launcher resolves the same
-    dependency set on its own. Paths are compared UNRESOLVED: the venv python is typically a
-    symlink to the base interpreter, so resolving would make them compare equal (exactly the
-    case this fixes), and pyvenv.cfg discovery keys off argv0's unresolved location. On Windows
-    the console python plus ``windows_detach_flags()`` keeps the action invisible without
-    pythonw.exe (which makes every console descendant flash its own conhost).
-
-    See #90026.
-    Falls back to ``sys.executable`` when no venv interpreter exists next to the install (in-process dev
-    runs, exotic layouts). See #54220, #56747.
-    """
-    from hermes_cli.web_server import PROJECT_ROOT
-    exe = Path(sys.executable)
-    try:
-        for rel in ("venv/bin/python", "venv/Scripts/python.exe"):
-            candidate = PROJECT_ROOT / rel
-            if candidate.is_file():
-                if os.path.normcase(os.path.normpath(str(candidate))) == (
-                    os.path.normcase(os.path.normpath(str(exe)))):
-                    return sys.executable
-                return str(candidate)
-    except OSError:
-        pass
-    return sys.executable
-
-
 def _named_profile_from_action(subcommand: List[str]) -> Optional[str]:
     """Return the named-profile selector that :func:`_profile_cli_args` puts in front of an action.
 
@@ -351,18 +318,40 @@ def _named_profile_from_action(subcommand: List[str]) -> Optional[str]:
     return None
 
 
+def _is_host_gateway_spawn(subcommand: List[str]) -> bool:
+    """True when *subcommand* starts the host multiplexer, not a named profile's own gateway.
+
+    ``hermes gateway restart`` and ``hermes -p default gateway restart`` are the host.
+    ``hermes -p coder gateway stop`` is not.
+    """
+    profile = _named_profile_from_action(subcommand)
+    if profile not in (None, "default"):
+        return False
+    args = list(subcommand)
+    if profile is not None:
+        if args and args[0] in {"-p", "--profile"}:
+            args = args[2:]
+        elif args and str(args[0]).startswith("--profile="):
+            args = args[1:]
+    return bool(args) and args[0] == "gateway"
+
+
 def _profile_action_environment(
     subcommand: List[str], env_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Resolve the web action's profile before building its isolated child environment."""
+    """Resolve the web action's profile before building its isolated child environment.
+
+    A host-gateway verb (bare ``gateway`` or ``-p default gateway``) targets the default root's
+    gateway, so a named-profile dashboard cannot donate its dotenv to the multiplexer."""
     from hermes_cli.profile_action_env import profile_action_environment
 
+    host = _is_host_gateway_spawn(subcommand)
     profile = _named_profile_from_action(subcommand)
     target_home = None
-    if profile is not None:
+    if profile is not None and not host:
         from hermes_cli.web_server_profiles import _resolve_profile_dir
         target_home = _resolve_profile_dir(profile)
-    return profile_action_environment(target_home, env_overrides)
+    return profile_action_environment(target_home, env_overrides, host=host)
 
 
 # Gateway lifecycle verbs the CLI refuses below root on a system-scope install
@@ -415,7 +404,8 @@ def _spawn_hermes_action(
     log_file = open(_ACTION_LOG_DIR / _ACTION_LOG_FILES[name], "ab", buffering=0)
     log_file.write(f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
 
-    cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
+    from hermes_cli._launchers import runtime_command
+    cmd = runtime_command(PROJECT_ROOT, subcommand)
     if _action_targets_system_gateway(subcommand):
         # A system-scope lifecycle verb spawned as the dashboard's own user can only ever write
         # "System gateway <verb> requires root" into this log, so the button never worked on a
@@ -458,15 +448,17 @@ def _spawn_hermes_action(
 
 
 def _own_profile_selector(profile: Optional[str]) -> Optional[str]:
-    """The profile a lifecycle verb addresses: the explicit selector, else the process's own named
+    """The profile a lifecycle verb addresses: the explicit selector, else the process's own
     profile (a pooled Desktop ``hermes --profile X serve`` answers ``/api/gateway/*`` without
-    ``?profile=``; an unscoped verb there is about X, not about the default home)."""
+    ``?profile=``; an unscoped verb there is about X). The default home resolves to the literal
+    ``"default"`` selector, never to a bare argv: a selector-less child re-reads the sticky
+    ``active_profile`` and would act on another profile's gateway (and skips the named-target
+    env scrub). ``None`` is reserved for a home that is not a profile home at all."""
     requested = (profile or "").strip()
     if requested:
         return requested
     from hermes_constants import get_process_hermes_home, profile_name_for_home
-    own = profile_name_for_home(get_process_hermes_home())
-    return own if own and own != "default" else None
+    return profile_name_for_home(get_process_hermes_home()) or None
 
 
 def _gateway_subcommand(profile: Optional[str], verb: str) -> List[str]:
@@ -475,12 +467,14 @@ def _gateway_subcommand(profile: Optional[str], verb: str) -> List[str]:
     that actually serves X — a ``-p X gateway restart`` child only exits 78 into the action log while the
     UI reports "restarted"); ``start``/``stop`` are refused by the caller (``multiplexed_profile_refusal``).
     The multiplexer is addressed as ``-p default`` explicitly: a bare ``gateway restart`` spawned from a
-    pooled ``--profile X serve`` would inherit X's ``HERMES_HOME`` and hit the same exit-78 refusal."""
+    pooled ``--profile X serve`` would inherit X's ``HERMES_HOME`` and hit the same exit-78 refusal. The
+    selector is explicit for the default home too: a bare child re-reads the sticky ``active_profile``
+    and would restart another profile's gateway."""
     from hermes_cli.web_server_profiles import _profile_cli_args
     profile = _own_profile_selector(profile)
     args = _profile_cli_args(profile)
     if profile and verb == "restart" and multiplexed_profile_refusal(profile, verb) is not None:
-        # Always explicit, even from the default home: a bare child re-reads the sticky active_profile.
+        # A served profile's restart targets the multiplexer, addressed as ``-p default``.
         args = ["-p", "default"]
     return args + ["gateway", verb]
 

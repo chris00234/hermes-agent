@@ -3,12 +3,26 @@
 import os
 from pathlib import Path
 
+# Process-global listener settings survive the launch-profile residue strip, so a child for another
+# profile must drop them or it binds the launcher's API port.
+_API_SERVER_LISTENER_KEYS = ("API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT", "API_SERVER_CORS_ORIGINS")
+
 
 def profile_action_environment(
-    target_home: Path | None, env_overrides: dict[str, str] | None = None,
+    target_home: Path | None, env_overrides: dict[str, str] | None = None, *, host: bool = False,
 ) -> dict[str, str]:
-    """Build a child environment; its normal startup loads the target profile's own dotenv."""
-    if target_home is None:
+    """Build a child environment; its normal startup loads the target profile's own dotenv.
+
+    ``host`` targets the default root's gateway: ``host_gateway_child_env`` supplies the default
+    profile's secrets in place of the launcher's, and ``target_home`` is not consulted."""
+    if host:
+        from hermes_constants import get_default_hermes_root
+        from tools.environments.local import _is_routed_home, host_gateway_child_env
+        action_env = host_gateway_child_env()
+        if _is_routed_home(get_default_hermes_root()):
+            for key in _API_SERVER_LISTENER_KEYS:
+                action_env.pop(key, None)
+    elif target_home is None:
         action_env = dict(os.environ)
     else:
         from hermes_cli.env_loader import (
@@ -28,7 +42,7 @@ def profile_action_environment(
             action_env.pop(key, None)
         strip_launch_profile_env(action_env, target_home)
         routed = _is_routed_home(target_home)
-        for key in ("API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT", "API_SERVER_CORS_ORIGINS"):
+        for key in _API_SERVER_LISTENER_KEYS:
             if routed or key in profile_keys:
                 action_env.pop(key, None)
             elif key in os.environ:
