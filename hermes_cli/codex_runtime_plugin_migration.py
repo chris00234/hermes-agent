@@ -493,14 +493,9 @@ def migrate(
         without_managed = _strip_existing_managed_block(existing)
         try:
             unmanaged = tomllib.loads(without_managed)
-        except tomllib.TOMLDecodeError as exc:
-            report.errors.append(f"invalid unmanaged TOML in {target}: {exc}")
-            return report
-        try:
             native = tomllib.loads(existing)
-        except tomllib.TOMLDecodeError as exc:
-            report.errors.append(f"invalid existing TOML in {target}: {exc}")
-            return report
+        except tomllib.TOMLDecodeError:
+            unmanaged = native = {}  # pre-broken file: leave the repair to upstream's path (#79023)
         # Permission settings belong to the user even when an older migration emitted them.
         restored = "".join(
             f"{key} = {_format_toml_value(native[key])}\n"

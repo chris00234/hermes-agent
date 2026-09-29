@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 import hermes_cli.plugins as plugins_mod
 import hermes_logging

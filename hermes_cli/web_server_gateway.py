@@ -4,6 +4,7 @@ subprocess spawning, gateway restart plumbing, system platform display.
 
 import logging
 import json
+import os
 import re
 import subprocess
 import sys
@@ -339,19 +340,73 @@ def _is_host_gateway_spawn(subcommand: List[str]) -> bool:
 def _profile_action_environment(
     subcommand: List[str], env_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Resolve the web action's profile before building its isolated child environment.
+    """Environment for a detached ``hermes <subcommand>`` action.
 
-    A host-gateway verb (bare ``gateway`` or ``-p default gateway``) targets the default root's
-    gateway, so a named-profile dashboard cannot donate its dotenv to the multiplexer."""
-    from hermes_cli.profile_action_env import profile_action_environment
+    The dashboard loads its own profile's ``.env`` into process-global ``os.environ``. Copying
+    that mapping verbatim into ``hermes -p <other> ...`` lets the named child see the dashboard
+    profile's platform credentials and ports *before* its own dotenv loads (``load_hermes_dotenv``
+    does not override keys already present): a supposedly A2A-only profile then claims the default
+    Discord token and binds the default API/BlueBubbles ports.
 
-    host = _is_host_gateway_spawn(subcommand)
+    Named-profile actions therefore start from Hermes' standard scrubbed subprocess env, then drop
+    the profile-managed keys plus every key declared by the dashboard/default profile dotenv files
+    and their hydrated secret sources, and pin ``HERMES_HOME`` to the target profile. The child's
+    normal startup then loads that profile's own ``.env``. A host-gateway verb (bare ``gateway``
+    or ``-p default gateway``) starts from ``host_gateway_child_env`` so a named-profile dashboard
+    cannot donate its dotenv to the multiplexer. Other actions without a profile selector keep
+    the historical environment exactly.
+    """
     profile = _named_profile_from_action(subcommand)
-    target_home = None
-    if profile is not None and not host:
+    if _is_host_gateway_spawn(subcommand):
+        from tools.environments.local import host_gateway_child_env
+        action_env = host_gateway_child_env()
+    elif profile is None:
+        action_env = dict(os.environ)
+    else:
+        from hermes_cli.env_loader import (
+            _PROFILE_MANAGED_ENV_KEYS, _env_keys_defined_in_dotenv, get_secret_source_values,
+        )
         from hermes_cli.web_server_profiles import _resolve_profile_dir
+        from hermes_constants import apply_subprocess_home_env, get_default_hermes_root
+        from tools.environments.local import build_subprocess_env, strip_launch_profile_env
+
         target_home = _resolve_profile_dir(profile)
-    return profile_action_environment(target_home, env_overrides, host=host)
+        action_env = build_subprocess_env(base=os.environ, scrub_secrets=True)
+
+        profile_keys = set(_PROFILE_MANAGED_ENV_KEYS)
+        try:
+            source_homes = {str(get_default_hermes_root()), str(get_hermes_home())}
+        except Exception:
+            source_homes = set()
+        for source_home in source_homes:
+            profile_keys.update(_env_keys_defined_in_dotenv(Path(source_home) / ".env"))
+            # Secret managers contribute locally named credentials that never appear in .env;
+            # the dashboard already hydrated its own sources, so their key names are a boundary too.
+            profile_keys.update(get_secret_source_values(source_home).keys())
+        for key in profile_keys:
+            action_env.pop(key, None)
+        # Authorization gates that reached this process outside any dotenv (unit-file
+        # ``Environment=``, an operator export) are not in ``profile_keys``; the target
+        # profile's ``.env`` rarely defines them, so they would survive into the child (#113270).
+        strip_launch_profile_env(action_env, target_home)
+
+        # Pin the child before import-time startup runs; the explicit -p flag stays authoritative
+        # and resolves to the same validated directory.
+        action_env["HERMES_HOME"] = str(target_home)
+        apply_subprocess_home_env(action_env)
+
+    action_env["HERMES_NONINTERACTIVE"] = "1"
+    # A config.yaml allow_all_users grant bridged into os.environ must not outlive the config that
+    # produced it: drop it so the restarted child re-derives the posture from its own config.yaml.
+    from gateway.config_loader import drop_bridged_env
+    drop_bridged_env(action_env)
+    # The dashboard runs inside the gateway process, so os.environ carries _HERMES_GATEWAY=1;
+    # inheriting it trips the child's in-process restart-loop guard (exit 1). Drop it, like
+    # the gateway's own restart watcher does (gateway/run.py, #52470).
+    action_env.pop("_HERMES_GATEWAY", None)
+    if env_overrides:
+        action_env.update(env_overrides)
+    return action_env
 
 
 # Gateway lifecycle verbs the CLI refuses below root on a system-scope install

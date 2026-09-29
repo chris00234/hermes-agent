@@ -48,7 +48,7 @@ def test_soft_release_is_idempotent_and_preserves_session_resources(close_raises
     agent._finalize_owned_session_row.assert_not_called()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("legacy_binding", [False, True])
 def test_gateway_soft_eviction_releases_writer_before_durable_resume(tmp_path, monkeypatch, legacy_binding):
     import fcntl

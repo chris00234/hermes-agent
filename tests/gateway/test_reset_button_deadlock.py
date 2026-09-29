@@ -70,6 +70,7 @@ def _make_runner_with_cached_agent(close_fn):
         platform=Platform.TELEGRAM, chat_type="dm",
     )
     runner.session_store = MagicMock()
+    runner.session_store.get_working_frame_scope.return_value = None
     runner.session_store.reset_session.return_value = new_entry
     runner.session_store._entries = {session_key: session_entry}
     runner.session_store._generate_session_key.return_value = session_key

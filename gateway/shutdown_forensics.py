@@ -115,25 +115,6 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
     return ctx
 
 
-def _diagnostic_command(script: str, timeout_seconds: float) -> list[str]:
-    """Keep the diagnostic bounded on POSIX hosts without GNU coreutils."""
-    timeout = shutil.which("timeout") or shutil.which("gtimeout")
-    if timeout:
-        return [timeout, f"{timeout_seconds:g}", "bash", "-c", script]
-    supervisor = (
-        "import os, signal, subprocess, sys\n"
-        "child = subprocess.Popen(['bash', '-c', sys.argv[2]], start_new_session=True)\n"
-        "try:\n"
-        "    sys.exit(child.wait(timeout=float(sys.argv[1])))\n"
-        "except subprocess.TimeoutExpired:\n"
-        "    try: os.killpg(child.pid, signal.SIGKILL)\n"  # windows-footgun: ok — spawn_async_diagnostic returns early on Windows
-        "    except ProcessLookupError: pass\n"
-        "    child.wait()\n"
-        "    sys.exit(124)\n"
-    )
-    return [sys.executable, "-c", supervisor, str(timeout_seconds), script]
-
-
 def _async_diagnostic_script(signal_name: str, self_pid: int) -> str:
     """POSIX listing used by the detached diagnostic. Columns are identity/resource only — no argv."""
     return (
@@ -172,9 +153,13 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
         return None
     with contextlib.suppress(OSError):  # tighten logs created 0644 by earlier releases
         os.fchmod(fd, 0o600)
+    # GNU ``timeout`` (Homebrew: ``gtimeout``) is absent from stock macOS; without it the detached
+    # script still cannot block teardown, so run it unbounded rather than skip the diagnostic.
+    timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+    bound = [timeout_bin, f"{timeout_seconds:.0f}"] if timeout_bin else []
     try:  # start_new_session: outlive systemd killing our cgroup (KillMode=control-group) to flush
         return subprocess.Popen(
-            _diagnostic_command(script, timeout_seconds), stdout=fd,
+            [*bound, "bash", "-c", script], stdout=fd,
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
             close_fds=True).pid
     except OSError:
@@ -295,3 +280,4 @@ def parse_systemd_duration_to_us(raw: str) -> Optional[int]:
         elif digits and not _flush():
             return None
     return total_us if total_us > 0 else None
+

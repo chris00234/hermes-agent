@@ -43,6 +43,7 @@ def _make_runner(session_db=None):
     mock_store = MagicMock()
     mock_store.get_or_create_session.return_value = mock_session_entry
     runner.session_store = mock_store
+    runner.session_store.get_working_frame_scope.return_value = None
 
     return runner
 
@@ -166,6 +167,7 @@ class TestResetCommandWithTitle:
             chat_type="dm",
         )
         runner.session_store = MagicMock()
+        runner.session_store.get_working_frame_scope.return_value = None
         runner.session_store.get_or_create_session.return_value = new_session_entry
         runner.session_store.reset_session.return_value = new_session_entry
         runner.session_store._entries = {session_key: new_session_entry}

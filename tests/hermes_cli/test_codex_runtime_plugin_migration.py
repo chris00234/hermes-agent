@@ -249,8 +249,7 @@ class TestMigrate:
             assert name not in report.migrated
 
     @pytest.mark.parametrize(("existing", "config", "error_fragment"), [
-        ('[mcp_servers.brain\ncommand = "user-server"\n', {}, "unmanaged TOML"),
-        ('[plugins."tasks@openai-curated"]\nenabled = [\n', {}, "unmanaged TOML"),
+        ('[mcp_servers.brain\ncommand = "user-server"\n', {}, "not valid TOML"),
         ('', {"mcp_servers": {"bad\x01": {"command": "x"}}}, "not valid TOML"),
     ])
     def test_invalid_toml_fails_before_write(

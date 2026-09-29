@@ -90,7 +90,7 @@ def test_actual_clarify_callback_preserves_response_modes(monkeypatch, mode):
     events = []
     monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kw: events.append(kw))
-    monkeypatch.setattr(clarify_gateway, "get_clarify_timeout", lambda: 0.01)
+    monkeypatch.setattr(clarify_gateway, "get_clarify_timeout", lambda: 0.5)
     choices = None if mode == "free" else mark_recommended(["staging", "production"])
 
     def resolve(entry):

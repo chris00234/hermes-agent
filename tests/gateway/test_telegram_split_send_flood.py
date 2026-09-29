@@ -51,7 +51,6 @@ async def test_split_send_resumes_from_undelivered_tail_without_resending_head(m
 
     async def _penalty_elapses(_delay):  # the base retry sleep is mocked; model the window having passed
         adapter._telegram_send_cooldown_until.clear()
-        adapter._telegram_flood_until = 0
 
     monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", _penalty_elapses)
     content = _three_chunk_text()
@@ -68,7 +67,7 @@ async def test_split_send_resumes_from_undelivered_tail_without_resending_head(m
 @pytest.mark.asyncio
 async def test_over_cap_flood_returns_partial_overflow_and_arms_cooldown(monkeypatch):
     """A refusal past the base inline cap is returned typed (ledger owns the wait) but now carries the
-    partial_overflow contract; subsequent sends respect the shared bot flood deadline."""
+    partial_overflow contract; the next send to that chat fails closed locally, another chat is unaffected."""
     calls = {"n": 0}
 
     async def fake_send_message(text: str, **_kw):
@@ -89,11 +88,11 @@ async def test_over_cap_flood_returns_partial_overflow_and_arms_cooldown(monkeyp
     assert raw["partial_overflow"] is True and raw["delivered_chunks"] == 1 and raw["total_chunks"] == total >= 3
     assert raw["last_message_id"] == "1001" and len(raw["undelivered_chunks"]) == total - 1
     assert calls["n"] == 2
-    # The bot-wide deadline also fences different chats from extending a Telegram penalty.
+    # Facet 3: a follow-up send inside the penalty window makes no API call; a different chat still sends.
     again = await adapter.send("4242", "hello again")
     assert again.success is False and again.error.startswith("flood_control:") and calls["n"] == 2
     other = await adapter.send("999", "hello other")
-    assert other.success is False and other.error.startswith("flood_control:") and calls["n"] == 2
+    assert other.success is True and calls["n"] == 3
 
 
 @pytest.mark.asyncio

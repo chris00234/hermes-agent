@@ -934,7 +934,9 @@ def find_windows_gateway_services(
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
     from hermes_cli._launchers import runtime_command
-    args = ["--profile", profile]
+    args = []
+    if profile != "default":
+        args.extend(["--profile", profile])
     args.extend(["gateway", "run", "--replace"])
     return runtime_command(PROJECT_ROOT, args)
 
@@ -988,46 +990,16 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
 
 def launch_detached_gateway_restart_by_cmdline(old_pid: int, run_argv: list[str]) -> bool:
     """Relaunch a gateway with no profile→PID-file mapping by replaying its captured argv after exit."""
-    if old_pid <= 0 or not run_argv:
-        return False
-    import psutil
-    from gateway.status import profile_flag_value
-    from hermes_cli.profile_action_env import profile_action_environment
-    from hermes_cli.profiles import resolve_profile_env
-
-    profile = profile_flag_value(" ".join(run_argv))
-    try:
-        target_home = (
-            resolve_profile_env(profile) if profile is not None
-            else psutil.Process(old_pid).environ().get("HERMES_HOME")
-        )
-    except (psutil.Error, ValueError, FileNotFoundError):
-        return False
-    if not target_home:
-        return False
-    if profile is None:
-        home = Path(target_home)
-        profile = home.name if home.parent.name == "profiles" else "default"
-        # Pin the observed home even if active_profile changed since this
-        # gateway started; the CLI consumes selectors anywhere in its argv.
-        run_argv = [*run_argv, "--profile", profile]
-    env = profile_action_environment(Path(target_home), host=profile == "default")
-    return _spawn_gateway_restart_watcher(old_pid, list(run_argv), env=env)
+    return old_pid > 0 and bool(run_argv) and _spawn_gateway_restart_watcher(old_pid, list(run_argv))
 
 
 def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
     """Relaunch a manually-run profile gateway after its current PID exits."""
-    if old_pid <= 0:
-        return False
-    from hermes_cli.profile_action_env import profile_action_environment
-    from hermes_cli.profiles import resolve_profile_env
-
-    try:
-        target_home = Path(resolve_profile_env(profile))
-    except (ValueError, FileNotFoundError):
-        return False
-    env = profile_action_environment(target_home, host=profile == "default")
-    return _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile), env=env)
+    return old_pid > 0 and _spawn_gateway_restart_watcher(
+        old_pid,
+        _gateway_run_args_for_profile(profile),
+        host=profile == "default",
+    )
 
 
 GATEWAY_RESTART_WATCHER_TIMEOUT_S = 120
@@ -1094,9 +1066,7 @@ def _host_gateway_watcher_env() -> dict[str, str]:
     return env
 
 
-def _spawn_gateway_restart_watcher(
-    old_pid: int, run_argv: list[str], *, host: bool | None = None, env: dict[str, str] | None = None,
-) -> bool:
+def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: bool | None = None) -> bool:
     """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits. Watcher and respawn
     both need platform-appropriate detach: POSIX setsid; on Windows ``start_new_session`` does NOT detach
     (the watcher would die with the CLI console), so ``windows_detach_popen_kwargs()`` supplies flags."""
@@ -1120,8 +1090,6 @@ def _spawn_gateway_restart_watcher(
             # Fall back to the original argv: a visible window beats a failed respawn.
             respawn_cwd = ""
             respawn_env_overlay = {}
-    if env is not None and "HERMES_HOME" in env:
-        respawn_env_overlay["HERMES_HOME"] = env["HERMES_HOME"]
 
     # cwd/env overlay are embedded as JSON literals in the watcher source (no extra argv plumbing).
     watcher = textwrap.dedent(
@@ -1209,11 +1177,10 @@ def _spawn_gateway_restart_watcher(
     watcher_argv = [sys.executable, "-c", watcher, str(old_pid), *run_argv]
     devnull = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     # Host respawn must not inherit a named launcher's dotenv. The watcher copies os.environ
-    # into the gateway child, so the scrub has to be the watcher's own environ. A caller-built
-    # ``env`` already targets the relaunched profile and is used as-is.
-    watcher_env = env
-    if watcher_env is None and (_restart_argv_is_host_gateway(run_argv) if host is None else host):
-        watcher_env = _host_gateway_watcher_env()
+    # into the gateway child, so the scrub has to be the watcher's own environ.
+    watcher_env = _host_gateway_watcher_env() if (
+        _restart_argv_is_host_gateway(run_argv) if host is None else host
+    ) else None
     popen_env = {"env": watcher_env} if watcher_env is not None else {}
     # Same detach for the watcher itself, so closing the terminal doesn't kill it.
     try:
