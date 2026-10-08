@@ -222,6 +222,7 @@ def test_rewindable_probe_returns_false_when_classifier_raises(tmp_path, monkeyp
     monkeypatch.setattr(cc, "user_originated_turn_view", _boom)
     monkeypatch.setattr(cc, "split_user_originated_turn", _boom)
 
+    store._db_for_session_id = lambda session_id: store._db
     assert store.has_rewindable_user_turn("sess-1") is False
 
 
@@ -231,6 +232,7 @@ def test_rewindable_probe_requires_persisted_row_identity(tmp_path):
     store, _ = _make_store(tmp_path)
     store._db = _StubTranscriptDB([{"role": "user", "content": "hi"}])
 
+    store._db_for_session_id = lambda session_id: store._db
     assert store.has_rewindable_user_turn("sess-1") is False
 
 
@@ -238,4 +240,5 @@ def test_rewindable_probe_true_for_rewindable_turn(tmp_path):
     store, _ = _make_store(tmp_path)
     store._db = _StubTranscriptDB([{"role": "user", "content": "hi", "_row_id": 7}])
 
+    store._db_for_session_id = lambda session_id: store._db
     assert store.has_rewindable_user_turn("sess-1") is True

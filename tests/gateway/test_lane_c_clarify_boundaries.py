@@ -49,7 +49,7 @@ def test_generation_invalidation_cancels_pending_clarify():
         runner._invalidate_session_run_generation(key, reason="session_reset")
         assert not clarify_gateway.has_pending(key)
         assert entry.event.is_set()
-        assert entry.response == ""
+        assert entry.response == clarify_gateway.CANCELLED
         assert clarify_gateway.resolve_gateway_clarify(entry.clarify_id, "yes") is False
     finally:
         clarify_gateway.clear_session(key)

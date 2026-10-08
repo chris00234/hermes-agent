@@ -107,7 +107,10 @@ def test_actual_clarify_callback_preserves_response_modes(monkeypatch, mode):
     adapter = _ClarifyAdapter(resolve)
     turn = _turn_for_adapter(adapter)
     try:
-        response = turn._clarify_callback_sync("Pick a route", choices, mode == "multi")
+        reply = turn._clarify_callback_sync([
+            {"qid": "route", "question": "Pick a route", "choices": choices, "multi_select": mode == "multi"},
+        ])
+        response = reply["answers"].get("route", reply.get("notice", ""))
         entry = adapter.entries[0]
         if mode == "multi":
             assert entry.multi_select is True
