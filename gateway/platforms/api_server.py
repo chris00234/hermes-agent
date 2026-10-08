@@ -1277,6 +1277,16 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _api_server_skips_context_files(user_config: dict) -> bool:
+    """gateway.platforms.api_server.skip_context_files, as the messaging platforms honour it.
+
+    The api_server agent ignored it, so the isolated chat-only AIRI profile (no tools,
+    sessions started in ~) loaded ~/.hermes.md: coding action-bias rules, Brain admin
+    URLs and the owner-credential path (api-b76db8d098bfafd2, 2026-09-29)."""
+    platforms = (user_config.get("gateway") or {}).get("platforms") or {}
+    return isinstance(platforms, dict) and bool((platforms.get("api_server") or {}).get("skip_context_files"))
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -2555,6 +2565,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 save_trajectories=False,
                 checkpoints_enabled=False,
             )
+        if _api_server_skips_context_files(user_config):
+            # The SOUL persona stays: only cwd discovery (.hermes.md / AGENTS.md in ~) is dropped.
+            agent_kwargs.update(skip_context_files=True, load_soul_identity=True)
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
