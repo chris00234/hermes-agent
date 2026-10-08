@@ -89,3 +89,25 @@ def test_only_dispatcher_owned_workers_get_kanban_overrides(launch):
         server = config["mcp_servers"]["hermes-tools"]
         assert set(server) == {"env"}
         assert set(server["env"]) == {"HERMES_HOME"}
+
+
+def test_profile_brain_mcp_authenticates_as_the_profile(launch, tmp_path, monkeypatch):
+    """Sage's handoff crons run on the codex app-server runtime, whose shared config pins
+    mcp_servers.brain to BRAIN_ACTOR=codex_studio: every claim of a Sage task was 403
+    'assigned_agent must match authenticated principal' (task_744020a9d1f0, 10-07)."""
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.brain]\ncommand = "python"\n[mcp_servers.brain.env]\nBRAIN_ACTOR = "codex_studio"\n'
+    )
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / ".hermes" / "profiles" / "sage")
+    assert 'mcp_servers.brain.env.BRAIN_ACTOR="sage"' in launch({})
+
+
+def test_no_brain_override_without_a_brain_entry_or_a_profile(tmp_path):
+    (tmp_path / "config.toml").write_text('[mcp_servers.context7]\ncommand = "npx"\n')
+    assert cas._brain_actor_override(tmp_path / "profiles" / "sage", str(tmp_path)) == []
+    (tmp_path / "config.toml").write_text('[mcp_servers.brain]\ncommand = "python"\n')
+    assert cas._brain_actor_override(tmp_path / ".hermes", str(tmp_path)) == []

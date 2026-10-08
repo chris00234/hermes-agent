@@ -14,7 +14,9 @@ import queue
 import re
 import subprocess
 import threading
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.deadline import kill_process_tree
@@ -85,6 +87,27 @@ def _reap_snapshotted(descendants: list[Any]) -> None:
             child.kill()
 
 
+def _brain_actor_override(hermes_home: Path, codex_home: Optional[str]) -> list[str]:
+    """Brain MCP calls from a profile's Codex runtime authenticate as that profile.
+
+    The shared Codex config pins mcp_servers.brain to Chris's Codex CLI identity
+    (BRAIN_ACTOR=codex_studio), so Sage's handoff crons claimed their own Brain tasks
+    as 'codex' and got 403 'assigned_agent must match authenticated principal' on every
+    offer (task_744020a9d1f0, 10-07). Only overrides an entry the config defines: an
+    env-only entry has no transport and codex refuses to start."""
+    parts = hermes_home.parts
+    if "profiles" not in parts or parts.index("profiles") + 1 >= len(parts):
+        return []
+    config = Path(codex_home or os.path.expanduser("~/.codex")) / "config.toml"
+    try:
+        servers = tomllib.loads(config.read_text(encoding="utf-8")).get("mcp_servers") or {}
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    if not isinstance(servers.get("brain"), dict):
+        return []
+    return ["-c", f"mcp_servers.brain.env.BRAIN_ACTOR={json.dumps(parts[parts.index('profiles') + 1])}"]
+
+
 class CodexAppServerClient:
     """Minimal synchronous JSON-RPC 2.0 client for ``codex app-server`` over stdio.
 
@@ -118,6 +141,7 @@ class CodexAppServerClient:
 
         # The shared Codex config may still pin the profile that last ran migration.
         cmd += ["-c", f'mcp_servers.hermes-tools.env.HERMES_HOME={json.dumps(str(get_hermes_home()))}']
+        cmd += _brain_actor_override(get_hermes_home(), spawn_env.get("CODEX_HOME"))
         from agent.delegation_context import (
             DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
             delegated_child_subprocess_env, is_dispatcher_owned_worker_context,
