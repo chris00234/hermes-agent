@@ -160,6 +160,24 @@ def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     assert captured["ws_ping_timeout"] >= captured["ws_ping_interval"]
 
 
+def test_start_server_keeps_ws_ping_for_proxied_loopback_bind(monkeypatch):
+    """A loopback bind behind a reverse proxy (non-loopback ``dashboard.public_url``,
+    e.g. nginx + Cloudflare Tunnel) has the same half-open/idle-cut risk as a public
+    bind, so it keeps the enabled-ping window instead of the local-only ``None``.
+    """
+    from hermes_cli import dashboard_auth
+
+    captured = _stub_uvicorn(monkeypatch)
+    monkeypatch.setattr(web_server, "_dashboard_public_hosts", lambda: frozenset({"hermes.example.com"}))
+    monkeypatch.setattr(dashboard_auth, "list_providers", lambda: [type("P", (), {"name": "password"})()])
+
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert web_server.app.state.auth_required is True
+    assert captured["ws_ping_interval"] and captured["ws_ping_interval"] > 0
+    assert captured["ws_ping_timeout"] and captured["ws_ping_timeout"] >= captured["ws_ping_interval"]
+
+
 @pytest.mark.platforms("windows")
 def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     """The dashboard/desktop backend must serve uvicorn on the loop *uvicorn*

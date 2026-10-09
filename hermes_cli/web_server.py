@@ -1227,8 +1227,10 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
     # dead client sends a real FIN/RST -> WebSocketDisconnect. So: no ping on
     # loopback; non-loopback sits behind a Cloudflare Tunnel (~100s idle) and
     # keeps a config-driven cadence (dashboard.ws_ping_interval/_timeout,
-    # #79635) defaulting to 20/20.
-    _is_loopback = host in _LOOPBACK_HOST_VALUES
+    # #79635) defaulting to 20/20. A loopback bind gated by a non-loopback
+    # dashboard.public_url is served through a local reverse proxy and that
+    # same tunnel, so it keeps the configured cadence too.
+    _is_loopback = host in _LOOPBACK_HOST_VALUES and not app.state.auth_required
     try:
         _dash_cfg = load_config().get("dashboard") or {}
     except Exception:
