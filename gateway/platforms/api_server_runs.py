@@ -185,7 +185,7 @@ class _RunStream:
         self.subscribers.discard(queue)
 
 
-def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
+def _remember_room_retention(request: web.Request, claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
         request[_ROOM_RETENTION_REQUEST_KEY] = value
@@ -193,7 +193,7 @@ def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> 
         request._hermes_room_run_retention_until = value
 
 
-def _room_retention_until(request: "web.Request") -> float:
+def _room_retention_until(request: web.Request) -> float:
     try:
         value = request.get(_ROOM_RETENTION_REQUEST_KEY, 0)
     except AttributeError:
@@ -228,11 +228,11 @@ def terminal_run_status(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return status, fields
 
 
-def _run_not_found(_openai_error, run_id: str) -> "web.Response":
+def _run_not_found(_openai_error, run_id: str) -> web.Response:
     return _json_error(_openai_error, f"Run not found: {run_id}", code="run_not_found", status=404)
 
 
-def _uses_room_run_auth(self, request: "web.Request") -> bool:
+def _uses_room_run_auth(self, request: web.Request) -> bool:
     return request.path.endswith("/v1/runs") and bool(self._room_grant_token(request))
 
 
@@ -584,7 +584,7 @@ def _mark_shutdown_requested(self) -> int:
     return marked
 
 
-def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
+def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop, *, _api_server):
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
     private_run = run_id in self._private_run_ids
@@ -609,7 +609,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             with suppress(Exception):
                 loop.call_soon_threadsafe(q.put_nowait, event)
 
-    def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+    def _callback(event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs):
         # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
@@ -634,7 +634,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
     return _callback
 
 
-def _room_permission_for(request: "web.Request") -> str:
+def _room_permission_for(request: web.Request) -> str:
     if request.path.endswith("/stop"):
         return "stop"
     if request.path.endswith("/approval"):
@@ -642,7 +642,7 @@ def _room_permission_for(request: "web.Request") -> str:
     return "status" if request.method == "GET" else "dispatch"
 
 
-def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
+def _run_idempotency_scope(self, request: web.Request, *, _api_server) -> str:
     """Opaque auth/profile namespace; never persist bearer credentials."""
     if self._room_grant_token(request):
         claims = self._room_grant_claims(request, permission=_room_permission_for(request))
@@ -663,7 +663,7 @@ def _key_run_scope(self, profile, grant_attempt=None) -> str:
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
-def _check_run_auth(self, request: "web.Request", *, permission: str, _api_server) -> "web.Response | None":
+def _check_run_auth(self, request: web.Request, *, permission: str, _api_server) -> web.Response | None:
     if not self._room_grant_token(request):
         return self._check_auth(request)
     try:
@@ -684,7 +684,7 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
         return False
 
 
-def _durable_run_status(self, request: "web.Request", run_id: str) -> dict[str, Any] | None:
+def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
     """Hydrate a scoped run status and fail stale owners closed."""
     status = self._run_statuses.get(run_id)
     if status is not None:
@@ -717,7 +717,7 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> dict[str, 
 
 def _resolve_conversation_history(
     self, body: dict, raw_input: Any, *, _openai_error
-) -> "tuple[list[dict[str, str]], Any, Any, web.Response | None]":
+) -> tuple[list[dict[str, str]], Any, Any, web.Response | None]:
     """Return ``(history, instructions, stored_session_id, error)``; precedence:
     ``conversation_history`` > ``previous_response_id`` chain > all-but-last ``input`` messages."""
     instructions = body.get("instructions")
@@ -755,7 +755,7 @@ def _resolve_conversation_history(
     return conversation_history, instructions, stored_session_id, None
 
 
-def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":
+def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> web.Response:
     """202 admission response; replays are flagged via ``Idempotency-Replayed``."""
     headers = {"Idempotency-Replayed": "true"} if replayed else {}
     if gateway_session_key:
@@ -764,7 +764,7 @@ def _accepted_response(run_id: str, status: str, gateway_session_key, *, replaye
         {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
 
 
-def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> "web.Response":
+def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> web.Response:
     """409 for a fingerprint conflict, else a 202 replay of the already-admitted run."""
     if outcome == "conflict":
         return _json_error(
@@ -915,7 +915,7 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             _api_server._api_request_profile.reset(token)
 
 
-async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
     private_profile = (
@@ -1431,7 +1431,7 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         self._private_run_ids.discard(run_id)
 
 
-def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
+def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:
@@ -1470,7 +1470,7 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
     return run_id, status, agent, task, None
 
 
-async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Response:
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
@@ -1499,7 +1499,7 @@ async def _handle_run_lease(self, request: "web.Request", *, _api_server) -> "we
                               "lease_expires_at": expiry})
 
 
-async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
+async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.StreamResponse:
     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
     auth_err = self._check_auth(request)
     if auth_err:
@@ -1576,7 +1576,7 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
             try:
                 seq, event = await asyncio.wait_for(
                     q.get(), timeout=_api_server.CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await _write(b": keepalive\n\n")
                 continue
             if event is _RUN_STREAM_SUBSCRIBER_OVERFLOW:
@@ -1608,7 +1608,7 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
 _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
 
 
-async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
     run_id, _, _, _, err = _load_owned_run(
@@ -1662,7 +1662,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         "resolved": resolved})
 
 
-async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
     run_id, status, agent, _, err = _load_owned_run(
@@ -1709,7 +1709,7 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
 
-async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Response:
     """Interrupt a run; the stopping ACK is not terminal until its worker exits."""
     _openai_error = _api_server._openai_error
     run_id, status, agent, task, err = _load_owned_run(
