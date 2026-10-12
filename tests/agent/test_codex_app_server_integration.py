@@ -70,13 +70,13 @@ def _make_codex_agent(**kwargs):
 
 class TestRunConversationCodexPath:
     @pytest.mark.parametrize(
-        "reasoning_config,service_tier,expected_effort,expected_tier",
+        "reasoning_config,service_tier,expected_effort,expected_tier,expected_summary",
         [
-            ({"enabled": True, "effort": "high"}, "priority", "high", "fast"),
-            ({"enabled": False}, None, "none", None),
+            ({"enabled": True, "effort": "high"}, "priority", "high", "fast", "auto"),
+            ({"enabled": False}, None, "none", None, "none"),
             # Hermes-only levels are clamped to the route's vocabulary: gpt-5.4 has no `max`, so ultra goes out as xhigh.
             # A tier codex has no word for is not sent.
-            ({"enabled": True, "effort": "ultra"}, "ultrafast", "xhigh", None),
+            ({"enabled": True, "effort": "ultra"}, "ultrafast", "xhigh", None, "auto"),
         ],
     )
     def test_effective_runtime_settings_reach_codex_turn(
@@ -86,6 +86,7 @@ class TestRunConversationCodexPath:
         service_tier,
         expected_effort,
         expected_tier,
+        expected_summary,
     ):
         captured = {}
 
@@ -113,6 +114,7 @@ class TestRunConversationCodexPath:
 
         assert captured["model"] == "gpt-5.4"
         assert captured["reasoning_effort"] == expected_effort
+        assert captured["reasoning_summary"] == expected_summary
         assert captured["service_tier"] == expected_tier
 
     @pytest.mark.parametrize("model,expected", [("gpt-5.6-sol", "ultra"), ("gpt-5.5", "xhigh")])

@@ -40,5 +40,20 @@ def test_runtime_options_use_profile_effort_and_explicit_budget(tmp_path, monkey
     agent = SimpleNamespace(model="gpt-6-astra", reasoning_config=None, run_budget_seconds=budget,
                             _run_budget_started_at=2000 - elapsed)
     assert _codex_turn_options(agent) == {
-        "model": "gpt-6-astra", "reasoning_effort": "high", "turn_timeout": expected,
+        "model": "gpt-6-astra", "reasoning_effort": "high", "reasoning_summary": "auto", "turn_timeout": expected,
     }
+
+
+@pytest.mark.parametrize("model,reasoning_config,effort,summary", [
+    ("gpt-6-astra", {"enabled": True, "effort": "high"}, "high", "auto"),
+    ("gpt-5.4", {"enabled": False}, "none", "none"),
+    # No ``none`` level: the disable leaves effort unset, and the summary must still be off.
+    ("gpt-6-astra", {"enabled": False}, None, "none"),
+])
+def test_reasoning_summary_is_off_whenever_reasoning_is_disabled(tmp_path, monkeypatch, model, reasoning_config,
+                                                                 effort, summary):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    agent = SimpleNamespace(model=model, reasoning_config=reasoning_config, provider="openai-codex",
+                            base_url="https://chatgpt.com/backend-api/codex", run_budget_seconds=None)
+    options = _codex_turn_options(agent)
+    assert (options["reasoning_effort"], options["reasoning_summary"]) == (effort, summary)

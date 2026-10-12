@@ -720,7 +720,11 @@ def _codex_turn_options(agent) -> dict[str, Any]:
     model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
     if isinstance(reasoning, dict):
         effort = _codex_turn_effort(agent, model)
-    return {"model": model, "reasoning_effort": effort, "turn_timeout": timeout}
+    # Summary follows the Responses rule (``auto`` unless reasoning is off) but keys off the disable itself:
+    # a model without a ``none`` level gets effort None. Off sends ``none``, as turn/start settings are sticky.
+    reasoning_off = effort == "none" or (isinstance(reasoning, dict) and reasoning.get("enabled") is False)
+    return {"model": model, "reasoning_effort": effort, "reasoning_summary": "none" if reasoning_off else "auto",
+            "turn_timeout": timeout}
 
 
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: list[dict[str, Any]],

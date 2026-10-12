@@ -460,15 +460,16 @@ class CodexAppServerSession:
 
     def run_turn(
         self, user_input: Any, *, model: Optional[str] = None, reasoning_effort: Optional[str] = None,
-        service_tier: Optional[str] = None, turn_timeout: Optional[float] = 600.0,
+        reasoning_summary: Optional[str] = None, service_tier: Optional[str] = None,
+        turn_timeout: Optional[float] = 600.0,
         notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
-        model / reasoning_effort: sent on ``turn/start`` (codex applies them to this and later turns), so an
-        in-place ``/model`` or effort change reaches a thread that was started with other settings. A reasoning
-        ``summary`` rides along (``auto``; ``none`` with effort ``none``) like the Responses transport: without
-        it codex's reasoning items carry no text, so nothing is persisted or shown.
+        model / reasoning_effort / reasoning_summary: sent on ``turn/start`` (codex applies them to this and later
+        turns), so an in-place ``/model`` or effort change reaches a thread that was started with other settings.
+        Without a ``summary`` codex's reasoning items carry no text (live codex-cli 0.162.1), so nothing is
+        persisted or shown.
         service_tier: sent only when it differs from what this thread last received, so codex's own configured
         tier is left alone until Hermes selects one, and ``None`` after a selection clears it.
 
@@ -495,7 +496,8 @@ class CodexAppServerSession:
                     params["model"] = model
                 if reasoning_effort is not None:
                     params["effort"] = reasoning_effort
-                params["summary"] = "none" if reasoning_effort == "none" else "auto"
+                if reasoning_summary is not None:
+                    params["summary"] = reasoning_summary
                 if service_tier != self._service_tier_sent:
                     params["serviceTier"] = service_tier
                 ts = self._request_for(result, "turn/start", params, "turn/start")
