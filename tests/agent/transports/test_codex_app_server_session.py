@@ -408,6 +408,17 @@ class TestRunTurn:
             sent.append(next(p for (m, p) in client.requests if m == "turn/start").get("model"))
         assert sent == ["gpt-5.5", None]
 
+    @pytest.mark.parametrize("effort,expected", [("high", "auto"), (None, "auto"), ("none", "none")])
+    def test_turn_start_requests_a_reasoning_summary_unless_reasoning_is_off(self, effort, expected):
+        """Without ``summary`` codex's reasoning items carry no text, so nothing is persisted or shown;
+        ask for one like the Responses transport does."""
+        client = FakeClient()
+        client.queue_notification("turn/completed", threadId="t",
+                                  turn={"id": "turn-fake-001", "status": "completed", "error": None})
+        make_session(client).run_turn("hi", reasoning_effort=effort, turn_timeout=2.0)
+        _, params = next(req for req in client.requests if req[0] == "turn/start")
+        assert params["summary"] == expected
+
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""
         client = FakeClient()

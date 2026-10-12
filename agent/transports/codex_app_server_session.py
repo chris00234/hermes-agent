@@ -466,7 +466,9 @@ class CodexAppServerSession:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
         model / reasoning_effort: sent on ``turn/start`` (codex applies them to this and later turns), so an
-        in-place ``/model`` or effort change reaches a thread that was started with other settings.
+        in-place ``/model`` or effort change reaches a thread that was started with other settings. A reasoning
+        ``summary`` rides along (``auto``; ``none`` with effort ``none``) like the Responses transport: without
+        it codex's reasoning items carry no text, so nothing is persisted or shown.
         service_tier: sent only when it differs from what this thread last received, so codex's own configured
         tier is left alone until Hermes selects one, and ``None`` after a selection clears it.
 
@@ -493,6 +495,7 @@ class CodexAppServerSession:
                     params["model"] = model
                 if reasoning_effort is not None:
                     params["effort"] = reasoning_effort
+                params["summary"] = "none" if reasoning_effort == "none" else "auto"
                 if service_tier != self._service_tier_sent:
                     params["serviceTier"] = service_tier
                 ts = self._request_for(result, "turn/start", params, "turn/start")

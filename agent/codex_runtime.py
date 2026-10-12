@@ -775,9 +775,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
 def _turn_result(interrupt: tuple[bool, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
                  error: Any, final_response: Any, **extra: Any) -> dict[str, Any]:
     """Result shape shared with the chat_completions path (``partial`` == ``not completed``)."""
+    from agent.turn_finalizer import _last_turn_reasoning
     user_interrupted, interrupt_message = interrupt
     return {
-        "final_response": final_response, "messages": messages, "api_calls": api_calls,
+        "final_response": final_response, "last_reasoning": _last_turn_reasoning(messages), "messages": messages,
+        "api_calls": api_calls,
         "completed": completed, "partial": not completed, "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
         "error": error, **extra,

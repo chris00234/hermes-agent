@@ -146,6 +146,29 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    @pytest.mark.parametrize("current_reasoning", ["checked the config first", None])
+    def test_result_carries_only_the_current_turns_reasoning(self, monkeypatch, current_reasoning):
+        """The gateway, CLI and TUI show ``last_reasoning``; codex attaches it to the tool-call step, and a
+        prior turn's reasoning must never leak into this turn's display."""
+        def fake_run_turn(self, user_input, **kwargs):
+            tool_step = {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "exec_1", "type": "function", "function": {"name": "exec_command", "arguments": "{}"}}]}
+            if current_reasoning:
+                tool_step["reasoning"] = current_reasoning
+            return TurnResult(final_text="done", projected_messages=[
+                tool_step, {"role": "tool", "tool_call_id": "exec_1", "content": "ok"},
+                {"role": "assistant", "content": "done"},
+            ], turn_id="tu1", thread_id="th1")
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "th1")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        history = [{"role": "user", "content": "earlier"},
+                   {"role": "assistant", "content": "ok", "reasoning": "prior turn reasoning"}]
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello", conversation_history=history)
+        assert result["last_reasoning"] == current_reasoning
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
