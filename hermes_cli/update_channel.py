@@ -22,7 +22,8 @@ same path, and the channel opt-in must survive that.
   (it knows its own id — the user never types a sha).
 * Shown by ``hermes update --install-id`` and the desktop About page.
 * Source installs select an R2 channel name, or use an explicit branch override.
-  Unconfigured official checkouts track ``stable``; forks and mirrors keep ``main``.
+  Unconfigured official checkouts track ``stable``; forks, mirrors and checkouts on
+  their own branch keep ``main``.
   Bundles derive their channel from their baked identity, never these records.
   ``external`` installs have no configurable channel; the steward owns updates.
 
@@ -47,6 +48,9 @@ logger = logging.getLogger(__name__)
 CHANNEL_MAIN = "main"
 CHANNEL_STABLE = "stable"
 CHANNEL_CANARY = "canary"
+
+_BRANCH_HEAD_PREFIX = "ref: refs/heads/"
+_MAIN_BRANCH_HEAD = _BRANCH_HEAD_PREFIX + "main"
 
 
 # A canary source identity: the exact stable version plus a full UTC build
@@ -141,7 +145,8 @@ def default_channel(project_root: Optional[Path] = None) -> str:
     """The channel an unconfigured install tracks.
 
     A source checkout of the official repository follows the latest published
-    stable release. Forks, mirrors and checkout-less trees keep following main.
+    stable release. Forks, mirrors, checkout-less trees and checkouts on a branch
+    other than main keep following main.
     ``electron-updater`` and ``app-installer`` bundles report their artifact
     channel: a canary artifact tracks canary, every other bundle
     tracks stable. The stamp's ``tag`` is the authority, the same fact
@@ -155,7 +160,8 @@ def default_channel(project_root: Optional[Path] = None) -> str:
     root = Path(project_root) if project_root is not None else install_root()
     stamp = _read_stamp(root)
     if not _package_channel(stamp):
-        return CHANNEL_STABLE if _tracks_official_origin(root) else CHANNEL_MAIN
+        official = _tracks_official_origin(root) and not _on_custom_branch(root)
+        return CHANNEL_STABLE if official else CHANNEL_MAIN
     if stamp.get("source") == "channel-build":
         request = stamp.get("channelBuild")
         if not isinstance(request, dict):
@@ -187,6 +193,23 @@ def _tracks_official_origin(root: Path) -> bool:
             match = _GITHUB_ORIGIN.fullmatch(text.partition("=")[2].strip())
             return bool(match) and match[1].lower() == OFFICIAL_REPOSITORY.lower()
     return False
+
+
+def _on_custom_branch(root: Path) -> bool:
+    """True when ``root``'s HEAD is a local branch other than main.
+
+    A release lands detached at its exact commit, so the running tree would leave
+    that branch's own commits behind (the documented custom-branch setup:
+    ``updates.parked_branch_strategy: update_in_place``). Such a checkout is a fork
+    in all but its origin URL. Read from the HEAD file (no git process).
+    """
+    from hermes_cli._early_recovery import _git_dir
+
+    try:
+        head = (_git_dir(root) / "HEAD").read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return head.startswith(_BRANCH_HEAD_PREFIX) and head != _MAIN_BRANCH_HEAD
 
 
 def rides_default_channel(record: dict, channel: str, project_root: Optional[Path] = None) -> bool:

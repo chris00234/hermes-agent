@@ -390,3 +390,52 @@ def test_doctor_channel_records_are_read_only(tmp_path, monkeypatch, kind, expec
     assert [(key, reason) for key, _, reason in stale_channel_records(config)] == (
         [(key, expected)] if expected else [])
     assert config == before
+
+
+_OFFICIAL_ORIGIN = "https://github.com/NousResearch/hermes-agent.git"
+
+
+def _git(root: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _official_checkout(root: Path) -> Path:
+    root.mkdir(parents=True)
+    _git(root, "init", "-b", "main")
+    _git(root, "remote", "add", "origin", _OFFICIAL_ORIGIN)
+    _git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+         "commit", "--allow-empty", "-m", "base")
+    return root
+
+
+class TestOfficialCheckoutBranch:
+    """A release lands detached, so only main or a detached official checkout defaults to stable."""
+
+    @pytest.mark.parametrize("head,expected", [
+        ("main", CHANNEL_STABLE),
+        ("detached", CHANNEL_STABLE),
+        ("chris/managed-main", CHANNEL_MAIN),
+    ])
+    def test_default_follows_the_checked_out_branch(self, tmp_path, head, expected):
+        root = _official_checkout(tmp_path / "checkout")
+        if head == "detached":
+            _git(root, "checkout", "--detach")
+        elif head != "main":
+            _git(root, "checkout", "-b", head)
+        assert default_channel(root) == expected
+        assert resolve_update_channel({}, root) == expected
+
+    @pytest.mark.parametrize("detached,expected", [(False, CHANNEL_MAIN), (True, CHANNEL_STABLE)])
+    def test_linked_worktree_reads_its_own_head(self, tmp_path, detached, expected):
+        root = _official_checkout(tmp_path / "checkout")
+        worktree = tmp_path / "worktree"
+        _git(root, "worktree", "add", *(("--detach",) if detached else ("-b", "update/x")), str(worktree))
+        assert default_channel(worktree) == expected
+        assert default_channel(root) == CHANNEL_STABLE
+
+    def test_persisted_stable_still_wins_on_a_custom_branch(self, tmp_path):
+        root = _official_checkout(tmp_path / "checkout")
+        _git(root, "checkout", "-b", "chris/managed-main")
+        assert resolve_update_channel(_config_for(root, CHANNEL_STABLE), root) == CHANNEL_STABLE
