@@ -127,7 +127,8 @@ The kanban tools are gated by `HERMES_KANBAN_TASK` env var the dispatcher sets �
 | Model selection (`model.default`, `/model`) | yes | yes — sent on `thread/start` and every `turn/start`, so a mid-session `/model` applies to the next turn; a `-900k` variant goes out as its base slug (codex applies the extended window itself), and on codex's own provider an `openai/` prefix is dropped |
 | Reasoning effort and `/fast` | yes | yes — an explicit `reasoning_effort` (clamped to what the model accepts; `ultra` goes out as codex's own Ultra mode on models whose ladder reaches `max`; disabled reasoning goes out as `none`) and `/fast` ride on `turn/start`; without a Hermes setting, codex's own configured defaults apply |
 | Native Codex plugins (Linear, GitHub, etc.) | — | yes (auto-migrated) |
-| User MCP servers | yes | yes (auto-migrated to codex) |
+| User MCP servers | yes | yes (auto-migrated to codex; each one the profile declares runs under the profile's `HERMES_HOME`) |
+| Memory-provider recall, `pre_llm_call` hook context, gateway notes in the user turn | yes | yes — sent in the `turn/start` input and persisted as the row's `api_content` |
 | Memory + skill review (background) | yes | yes (via item projection) |
 | System prompt / SOUL.md / channel `system_prompt` overrides | yes | yes (sent once as developer instructions on thread start) |
 | Multi-turn conversations | yes | yes |
@@ -421,6 +422,8 @@ What translates:
 
 What's not migrated:
 - Hermes-specific keys like `sampling` (Codex's MCP client has no equivalent — these are dropped with a per-server warning).
+
+Codex launches these servers from the shared `config.toml`, so profile-level tool filters (`tools.include`) and `enabled` flags are not applied per profile to the servers it launches; each stdio server the active profile declares (and the codex config defines) does run under that profile's `HERMES_HOME`.
 
 ## Native Codex plugin migration
 
