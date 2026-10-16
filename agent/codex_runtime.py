@@ -734,7 +734,8 @@ def _codex_turn_options(agent) -> dict[str, Any]:
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: list[dict[str, Any]],
                               effective_task_id: str, should_review_memory: bool = False) -> dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
-    Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    Returns the chat_completions result shape. ``user_message`` is the turn's wire input (the prologue's
+    api_content stamp when context was injected); the user row is ALREADY in ``messages`` — never append it again."""
     from agent.private_execution import private_execution_active
     if private_execution_active(agent):
         raise RuntimeError("Private execution does not support codex_app_server")
