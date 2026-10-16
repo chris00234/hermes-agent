@@ -27,6 +27,9 @@ command = "hermes-tools-mcp"
 [mcp_servers.off]
 command = "off-mcp"
 
+[mcp_servers.quiet]
+command = "quiet-mcp"
+
 [mcp_servers.other]
 command = "other-mcp"
 """
@@ -36,6 +39,7 @@ mcp_servers:
   brain: {command: brain-mcp}
   rea: {command: rea-mcp}
   off: {command: off-mcp, enabled: false}
+  quiet: {command: quiet-mcp, enabled: "false"}
   penpot: {url: "http://127.0.0.1:9/mcp"}
 """
 
@@ -101,7 +105,7 @@ def test_each_declared_codex_server_gets_the_profile_home(launch, profile_home):
     assert brain == [f"mcp_servers.brain.env.HERMES_HOME={json.dumps(str(profile_home))}"]
     targeted = [_server_of(arg) for arg in overrides]
     assert targeted.count("hermes-tools") == 1
-    assert not {"rea", "off", "penpot", "other"} & set(targeted)
+    assert not {"rea", "off", "quiet", "penpot", "other"} & set(targeted)
 
 
 def test_overrides_merge_into_existing_codex_tables(launch, profile_home):

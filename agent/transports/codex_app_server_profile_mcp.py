@@ -22,13 +22,14 @@ from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAM
 def _declared_stdio_servers() -> set[str]:
     """Stdio servers the active profile declares and has not disabled."""
     from hermes_cli.config import load_config_readonly
+    from tools.mcp_tool_common import mcp_server_enabled
 
     servers = load_config_readonly().get("mcp_servers") or {}
     if not isinstance(servers, dict):
         return set()
     return {
         name for name, spec in servers.items()
-        if isinstance(spec, dict) and spec.get("command") and spec.get("enabled") is not False
+        if isinstance(spec, dict) and spec.get("command") and mcp_server_enabled(spec)
     }
 
 
