@@ -118,6 +118,11 @@ class CodexAppServerClient:
 
         # The shared Codex config may still pin the profile that last ran migration.
         cmd += ["-c", f'mcp_servers.hermes-tools.env.HERMES_HOME={json.dumps(str(get_hermes_home()))}']
+        from agent.transports.codex_app_server_profile_mcp import profile_mcp_home_overrides
+
+        # Every other server the profile declares runs under its HERMES_HOME too, as Hermes'
+        # own MCP client launches it.
+        cmd += profile_mcp_home_overrides(spawn_env, str(get_hermes_home()))
         from agent.delegation_context import (
             DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
             delegated_child_subprocess_env, is_dispatcher_owned_worker_context,
