@@ -210,6 +210,10 @@ def restore_provenance(runner, source, provenance):
     if provenance != expected:
         raise RuntimeStoreError('profile_mismatch')
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
+    # Pin the identity live ingress pinned (same order: identity first, then the bound home): a
+    # route this source creates — a new Telegram DM topic's first message — persists its bot.
+    from gateway.session_identity import canonical_identity
+    canonical_identity(source, runner=runner, adapter=adapter, transport_profile=provenance.get('transport_profile'))
     source._transport_adapter_ref = weakref.ref(adapter)
     source._authorization_profile_home = home
     return runtime_home

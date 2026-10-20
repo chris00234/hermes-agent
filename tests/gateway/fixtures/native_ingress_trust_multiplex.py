@@ -95,6 +95,10 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
     assert provenance['runtime_home'] == str(state.resolve()), provenance
     assert worker_scopes == [(str(state), 'runtime-fixture-key')], worker_scopes
     assert len(adapter.deliveries) and not primary.deliveries, (adapter.deliveries, primary.deliveries)
+    # A lane first created by a plain-text native admission persists its receiving bot, in the routing
+    # entry and in the sessions row (a brand-new Telegram DM topic is exactly such a lane).
+    assert entry.transport_profile == 'transport', entry.to_dict()
+    assert authority.db.get_session(entry.session_id)['transport_profile'] == 'transport'
     # Runtime's allowed sender is explicitly NOT allowed by this transport.
     denied = MessageEvent(text='WRONG_TRANSPORT_SENDER', message_id='deny', source=adapter.build_source(
         chat_id='mux-chat', chat_type='dm', user_id='runtime-only'))
@@ -131,6 +135,16 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
                 await asyncio.wait_for(authority.sessions[entry.session_id].task, 10)
         assert all(row['outcome'] == 'completed' for row in rows(entry.session_id))
         assert worker_scopes == [(str(state), 'runtime-fixture-key')] * 2 + [(str(state), 'runtime-fresh-key')], worker_scopes
+        # A new Telegram DM topic is a new lane whose first input is plain text.
+        topic = adapter.build_source(chat_id='mux-chat', chat_type='dm', user_id='fixture-user', thread_id='97317')
+        await adapter.handle_message(MessageEvent(text='NEW_TOPIC', source=topic, message_id='topic-1'))
+        await async_wait_until(lambda: not adapter._active_sessions, timeout=10, what='the adapter to finish its session')
+        lane = runner.session_store.get_or_create_session(topic)
+        if authority.sessions[lane.session_id].task is not None:
+            await asyncio.wait_for(authority.sessions[lane.session_id].task, 10)
+        assert lane.session_key.endswith(':97317') and lane.session_id != entry.session_id, lane.session_key
+        assert lane.transport_profile == 'transport', lane.to_dict()
+        assert authority.db.get_session(lane.session_id)['transport_profile'] == 'transport'
     if mode == 'capture':
         # A queued storage fixture derived from the actual committed callback envelope.
         # This is restart reauthorization evidence, not a native post-ACK kill claim.
