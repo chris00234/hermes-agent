@@ -6,7 +6,7 @@ policy-bound run is truncated in memory and never touches
 ``$HERMES_HOME/cache/spillover``; public runs keep the persistence path.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,7 +24,7 @@ def _isolate_hermes(tmp_path, monkeypatch):
 def _policy():
     from gateway.private_execution_policy import build_policy
 
-    lease = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+    lease = (datetime.now(UTC) + timedelta(hours=1)).strftime(
         "%Y-%m-%dT%H:%M:%S+00:00"
     )
     return build_policy(

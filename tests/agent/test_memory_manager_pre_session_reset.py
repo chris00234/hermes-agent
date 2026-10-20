@@ -191,7 +191,7 @@ def test_state_preserving_reset_error_propagates_unchanged():
 
 
 def test_timed_out_retirement_is_abandoned_and_never_clears(monkeypatch):
-    import agent.memory_manager as memory_manager
+    from agent import memory_manager
 
     monkeypatch.setattr(memory_manager, "_PRE_SESSION_RESET_TIMEOUT_S", 0.05)
     provider = _FrameProvider(ack=_ref(revision=4, cleared=True), sync_delay=0.4)
@@ -252,3 +252,30 @@ def test_expired_caller_deadline_abandons_before_provider_runs():
     assert all(event[0] != "reset" for event in provider.events), (
         "a retirement whose caller deadline already expired must never run"
     )
+
+
+@pytest.mark.parametrize("same_profile", [True, False])
+def test_retirement_requires_provider_owner_profile(tmp_path, same_profile):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    owner = tmp_path / "owner"
+    caller = owner if same_profile else tmp_path / "other"
+    provider = _FrameProvider(ack=_ref(revision=4, cleared=True))
+    token = set_hermes_home_override(str(owner))
+    try:
+        manager = _manager(provider)
+        manager.initialize_all("sess-1", hermes_home=str(owner))
+    finally:
+        reset_hermes_home_override(token)
+    token = set_hermes_home_override(str(caller))
+    try:
+        if same_profile:
+            assert manager.on_pre_session_reset("sess-1", reference=_ref())["cleared"]
+            assert provider.events == [("reset", "sess-1", False)]
+        else:
+            with pytest.raises(RuntimeError, match="caller profile"):
+                manager.on_pre_session_reset("sess-1", reference=_ref())
+            assert provider.events == []
+    finally:
+        reset_hermes_home_override(token)
+        manager.shutdown_all()

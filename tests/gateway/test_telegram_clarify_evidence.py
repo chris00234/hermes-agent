@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -62,7 +62,7 @@ def lane(monkeypatch):
 def _message(message_id, *, bot=False, text="2", user_id=777, reply_id=100, **extra):
     data = {
         "message_id": message_id,
-        "date": int(datetime.now(timezone.utc).timestamp()),
+        "date": int(datetime.now(UTC).timestamp()),
         "chat": {"id": 123, "type": "private"},
         "from": {"id": 900 if bot else user_id, "is_bot": bot, "first_name": "User"},
         "text": text,

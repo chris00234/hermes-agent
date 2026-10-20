@@ -81,7 +81,7 @@ def _cached_agent_manager(runner, session_key: str):
         return None
 
 
-def _build_bare_reset_manager(runner, session_key: str, scope: Dict[str, Any]):
+def _build_bare_reset_manager(runner, session_key: str, scope: dict[str, Any]):
     """Load the configured provider uninitialized and wrap it for retirement.
 
     Never calls ``provider.initialize()`` and never constructs an AIAgent:
@@ -124,7 +124,7 @@ def _build_bare_reset_manager(runner, session_key: str, scope: Dict[str, Any]):
 
 
 def _resolve_reset_manager(runner, session_key: str,
-                           scope: Dict[str, Any]) -> Tuple[Optional[Any], bool]:
+                           scope: dict[str, Any]) -> tuple[Optional[Any], bool]:
     manager = _cached_agent_manager(runner, session_key)
     if manager is not None:
         return manager, False
@@ -133,8 +133,8 @@ def _resolve_reset_manager(runner, session_key: str,
 
 
 def retire_working_frame_scope_sync(runner, session_key: str,
-                                    scope: Dict[str, Any], rewound: bool,
-                                    deadline: Optional[float] = None) -> Dict[str, Any]:
+                                    scope: dict[str, Any], rewound: bool,
+                                    deadline: Optional[float] = None) -> dict[str, Any]:
     """Retire the acknowledged frame; return the durable cleared ACK.
 
     Raises on any failure so the caller fails closed (no reset/rewind).
@@ -154,7 +154,7 @@ def retire_working_frame_scope_sync(runner, session_key: str,
     manager, bare = _resolve_reset_manager(runner, session_key, scope)
     if manager is None:
         raise RuntimeError("No memory manager available for working frame retirement")
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     if deadline is not None:
         kwargs["timeout"] = max(0.0, deadline - time.monotonic())
     timed_out = False

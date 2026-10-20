@@ -9,7 +9,7 @@ denied call never reaches ``_begin_tool_execution``.
 
 import json
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,7 +30,7 @@ def _policy(allowed=("alpha",), lease_offset_s=3600, lease=None, run_id="run-1")
 
     if lease is None:
         lease = (
-            datetime.now(timezone.utc) + timedelta(seconds=lease_offset_s)
+            datetime.now(UTC) + timedelta(seconds=lease_offset_s)
         ).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     return build_policy(
         run_id=run_id,
@@ -177,7 +177,7 @@ def _raw_policy(allowed):
     allowed_toolsets still carries a denied tool's toolset."""
     from gateway.private_execution_policy import PrivateExecutionPolicy
 
-    lease = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+    lease = (datetime.now(UTC) + timedelta(hours=1)).strftime(
         "%Y-%m-%dT%H:%M:%S+00:00"
     )
     return PrivateExecutionPolicy(

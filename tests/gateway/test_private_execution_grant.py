@@ -177,5 +177,3 @@ class TestMintGrant:
             grant, SECRET, profile=PROFILE, now=NOW
         )
         assert toolsets == ("shell", "web_search")
-
-

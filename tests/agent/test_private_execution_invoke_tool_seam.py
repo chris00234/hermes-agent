@@ -7,7 +7,7 @@ blocks a call the private execution policy does not allow.
 """
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,7 +24,7 @@ def _isolate_hermes(tmp_path, monkeypatch):
 def _policy():
     from gateway.private_execution_policy import build_policy
 
-    lease = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+    lease = (datetime.now(UTC) + timedelta(hours=1)).strftime(
         "%Y-%m-%dT%H:%M:%S+00:00"
     )
     return build_policy(
@@ -98,7 +98,7 @@ def test_invoke_tool_seam_denied_tool_blocked(monkeypatch):
     monkeypatch.setattr(
         registry, "get_toolset_for_tool", {"delegate_task": "delegation"}.get
     )
-    lease = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+    lease = (datetime.now(UTC) + timedelta(hours=1)).strftime(
         "%Y-%m-%dT%H:%M:%S+00:00"
     )
     policy = PrivateExecutionPolicy(

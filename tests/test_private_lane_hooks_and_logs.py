@@ -287,12 +287,13 @@ class TestPrivateLogFilter:
         # launchd captures gateway stderr into gateway.error.log - one file
         # for every served profile under multiplex.
         from gateway import run as gateway_run
+        from gateway.run_bootstrap import _start_gateway_configure_logging
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
         monkeypatch.setattr(
             "tools.skills_sync.sync_skills", lambda quiet=True: None
         )
-        gateway_run._start_gateway_configure_logging(0)
+        _start_gateway_configure_logging(0)
         lg = logging.getLogger("gateway.run")
         with _bound_policy():
             lg.warning("PRIVATE-STDERR-abc123")

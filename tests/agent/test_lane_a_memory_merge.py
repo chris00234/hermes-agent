@@ -178,7 +178,7 @@ def test_worker_unavailable_never_fakes_lifecycle_ack(manager, failure):
 
 @pytest.mark.parametrize("operation", ["checkpoint", "switch"])
 def test_scope_sink_refusal_is_not_a_successful_boundary(manager, operation):
-    mm, provider = manager
+    mm, _provider = manager
     mm.set_working_frame_scope_sink(lambda ref: False)
     if operation == "checkpoint":
         with pytest.raises(RuntimeError, match="durably acknowledged"):

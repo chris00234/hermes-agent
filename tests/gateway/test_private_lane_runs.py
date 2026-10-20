@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 from hashlib import sha256
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -93,7 +94,12 @@ def adapter():
 
 class TestGrantAdmission:
     @pytest.mark.asyncio
-    async def test_valid_grant_starts_run_and_binds_policy(self, adapter):
+    @pytest.mark.parametrize("authority_present", [False, True])
+    async def test_valid_grant_starts_run_and_binds_policy(self, adapter, monkeypatch, authority_present):
+        if authority_present:
+            adapter.gateway_runner = SimpleNamespace(session_authority=object())
+        admit = AsyncMock(side_effect=AssertionError("private runs must not enter durable admission"))
+        monkeypatch.setattr(runs_mod, "_admit_run_to_authority", admit)
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as create:
@@ -109,6 +115,7 @@ class TestGrantAdmission:
                     cli, run_id, {"completed"}, headers={GRANT_HEADER: _grant()}
                 )
 
+        admit.assert_not_awaited()
         assert run_id in adapter._private_run_ids
         policy = create.call_args.kwargs["private_execution_policy"]
         assert policy.run_id == run_id
@@ -621,8 +628,8 @@ class TestMetadataOnlyDurableStatus:
 
         path = tmp_path / "idem.db"
         scope = sha256(
-            "default\0unauthenticated-test-listener"
-            "\0private-grant\0attempt-1".encode()
+            b"default\0unauthenticated-test-listener"
+            b"\0private-grant\0attempt-1"
         ).hexdigest()
         store = RunIdempotencyStore(str(path))
         store.reserve(
@@ -781,7 +788,10 @@ class TestEgressGating:
         agent.steer.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_private_approval_choices_limited_to_once_deny(self, adapter):
+    @pytest.mark.parametrize("authority_present", [False, True])
+    async def test_private_approval_choices_limited_to_once_deny(self, adapter, authority_present):
+        if authority_present:
+            adapter.gateway_runner = SimpleNamespace(session_authority=object())
         app = _create_runs_app(adapter)
         grant = _grant()
         async with TestClient(TestServer(app)) as cli:
@@ -830,7 +840,10 @@ class TestEgressGating:
 
 class TestStopVersusTermination:
     @pytest.mark.asyncio
-    async def test_stop_ack_is_not_terminal_until_worker_exits(self, adapter):
+    @pytest.mark.parametrize("authority_present", [False, True])
+    async def test_stop_ack_is_not_terminal_until_worker_exits(self, adapter, authority_present):
+        if authority_present:
+            adapter.gateway_runner = SimpleNamespace(session_authority=object())
         app = _create_runs_app(adapter)
         grant = _grant()
         run_can_finish = threading.Event()

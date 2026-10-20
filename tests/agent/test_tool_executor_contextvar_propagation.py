@@ -1,6 +1,7 @@
 """Private execution context propagation regression guards."""
 
 import concurrent.futures
+from datetime import UTC
 
 
 def _make_private_policy():
@@ -8,7 +9,7 @@ def _make_private_policy():
 
     from gateway.private_execution_policy import build_policy
 
-    lease = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+    lease = (datetime.now(UTC) + timedelta(hours=1)).strftime(
         "%Y-%m-%dT%H:%M:%S+00:00"
     )
     return build_policy(

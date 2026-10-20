@@ -14,7 +14,7 @@ import logging
 import re
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ def renew_private_lease(
     current = datetime.fromisoformat(policy.effective_lease_expires_at).timestamp()
     if current <= now or expiry < current or expiry > now + 1800:
         raise GrantError("renewal must extend a live lease by at most 30 minutes")
-    policy._lease.expires_at = datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat()
+    policy._lease.expires_at = datetime.fromtimestamp(expiry, tz=UTC).isoformat()
     return policy._lease.expires_at
 
 

@@ -11,7 +11,7 @@ from agent.memory_provider import sanitize_working_frame_reference
 logger = logging.getLogger("gateway.session")
 
 
-def working_frame_scope_or_none(data: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
+def working_frame_scope_or_none(data: dict[str, Any], key: str) -> Optional[dict[str, Any]]:
     """An invalid persisted scope must never drop the enclosing route."""
     try:
         return sanitize_working_frame_reference(data.get(key))
@@ -23,7 +23,7 @@ def working_frame_scope_or_none(data: Dict[str, Any], key: str) -> Optional[Dict
 class SessionWorkingFrameMixin:
     """Persist current/continuation ACKs before publishing them in memory."""
 
-    def get_working_frame_scope(self, session_key: str) -> Optional[Dict[str, Any]]:
+    def get_working_frame_scope(self, session_key: str) -> Optional[dict[str, Any]]:
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
@@ -36,14 +36,14 @@ class SessionWorkingFrameMixin:
             return None
 
     @staticmethod
-    def _scope_ack_advances(previous: Dict[str, Any], reference: Dict[str, Any]) -> bool:
+    def _scope_ack_advances(previous: dict[str, Any], reference: dict[str, Any]) -> bool:
         if any(previous[key] != reference[key] for key in
                ("provider", "principal", "agent", "project", "session_id")):
             return False
         return reference["revision"] > previous["revision"] or reference == previous
 
     @staticmethod
-    def _scope_new_lifetime(current: Dict[str, Any], reference: Dict[str, Any]) -> bool:
+    def _scope_new_lifetime(current: dict[str, Any], reference: dict[str, Any]) -> bool:
         """Only a cleared ACK or expiry permits a new lifetime's revision restart."""
         return (
             reference["logical_task_id"] != current["logical_task_id"]
@@ -51,7 +51,7 @@ class SessionWorkingFrameMixin:
         )
 
     @staticmethod
-    def _scope_ack_continues(source: Dict[str, Any], reference: Dict[str, Any]) -> bool:
+    def _scope_ack_continues(source: dict[str, Any], reference: dict[str, Any]) -> bool:
         return (
             reference.get("source_session_id") == source["session_id"]
             and reference.get("source_revision") == source["revision"]
@@ -61,7 +61,7 @@ class SessionWorkingFrameMixin:
                      "lifecycle_epoch", "cleared"))
         )
 
-    def _merge_scope_reference(self, entry, expected_session_id: str, clean: Dict[str, Any]):
+    def _merge_scope_reference(self, entry, expected_session_id: str, clean: dict[str, Any]):
         current = sanitize_working_frame_reference(entry.working_frame_scope)
         pending = sanitize_working_frame_reference(entry.working_frame_pending_scope)
         if pending and pending["session_id"] == expected_session_id:
@@ -82,7 +82,7 @@ class SessionWorkingFrameMixin:
         return None
 
     def record_working_frame_scope(
-        self, session_key: str, expected_session_id: str, reference: Dict[str, Any],
+        self, session_key: str, expected_session_id: str, reference: dict[str, Any],
         *, active_profile: Optional[str] = None,
     ) -> bool:
         """Route/profile CAS: record a current ACK or proven compression continuation."""

@@ -151,7 +151,7 @@ async def test_reset_without_scope_keeps_legacy_behavior():
 async def test_reset_retires_scope_before_invalidation():
     order = []
     manager = _FakeManager(order=order)
-    runner, session_key = _make_runner(scope=_ref(), manager=manager)
+    runner, _session_key = _make_runner(scope=_ref(), manager=manager)
     runner._invalidate_session_run_generation = (
         lambda key, reason="": order.append("invalidate") or 1
     )

@@ -1,6 +1,6 @@
 """Native SDK transport harness; only transport/observer sinks are replaced."""
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +22,7 @@ CHOICES = ["A", "B"]
 def message(message_id=101, *, bot=False, text="2", **changes):
     data = {
         "message_id": message_id,
-        "date": int(datetime.now(timezone.utc).timestamp()),
+        "date": int(datetime.now(UTC).timestamp()),
         "chat": {"id": 123, "type": "private"},
         "from": {"id": 900 if bot else 777, "is_bot": bot, "first_name": "User"},
         "text": text,

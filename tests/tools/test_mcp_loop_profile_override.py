@@ -8,6 +8,7 @@ get_hermes_home() inside the coroutine, most visibly OAuth token-store
 paths. _run_on_mcp_loop now wraps scheduled coroutines with the caller's
 override (mcp_tool_loop._wrap_with_home_override).
 """
+import asyncio
 import os
 
 import pytest
@@ -125,10 +126,11 @@ def test_stdio_subprocess_inherits_session_profile(tmp_path, monkeypatch, mcp_lo
     async def child_environment():
         env = _build_safe_env(None)
         assert "OPENAI_API_KEY" not in env
-        return subprocess.check_output(
+        output = await asyncio.to_thread(subprocess.check_output,
             [sys.executable, "-c", "import os; print(os.environ['HERMES_HOME'])"],
             env=env, text=True,
-        ).strip()
+        )
+        return output.strip()
 
     token = set_hermes_home_override(str(session_home))
     try:

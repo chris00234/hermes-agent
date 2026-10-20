@@ -115,7 +115,7 @@ async def test_callback_authorization_scope_cannot_change_original_route(
 
 @pytest.mark.asyncio
 async def test_pending_text_candidate_cannot_steal_winning_callback(callback_lane):
-    adapter, runner, _, events, received = callback_lane
+    adapter, _runner, _, events, received = callback_lane
     await _send(adapter)
     await _receive(adapter)
     await _tap(adapter)

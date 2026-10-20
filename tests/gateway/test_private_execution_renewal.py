@@ -3,7 +3,7 @@
 import asyncio
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +39,7 @@ async def test_http_renewal_reaches_running_tool_context_without_widening_author
     class ToolClock(datetime):
         @classmethod
         def now(cls, tz=None):
-            return datetime.fromtimestamp(original_expiry + 1, timezone.utc)
+            return datetime.fromtimestamp(original_expiry + 1, UTC)
 
     monkeypatch.setattr(executor, "datetime", ToolClock)
 
@@ -104,7 +104,7 @@ async def test_http_renewal_reaches_running_tool_context_without_widening_author
 def test_renewal_cannot_revive_or_reauthorize_a_policy(case):
     now = time.time()
     policy = build_policy(run_id="run", profile="liz", execution_attempt_id="attempt", allowed_toolsets=("file",),
-                          lease_expires_at=datetime.fromtimestamp(now + (-1 if case == "expired" else 300), timezone.utc).isoformat())
+                          lease_expires_at=datetime.fromtimestamp(now + (-1 if case == "expired" else 300), UTC).isoformat())
     grant = mint_grant(SECRET, attempt_id="other" if case == "attempt" else "attempt",
                        profile="ellie" if case == "profile" else "liz",
                        expiry=int(now) + (1801 if case == "unbounded" else 900),

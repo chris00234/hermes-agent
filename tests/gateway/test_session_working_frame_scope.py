@@ -51,7 +51,7 @@ def _make_store(tmp_path, *, session_id="sess-1", profile="jenna"):
 
 
 def test_record_then_get_round_trip(tmp_path):
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.get_working_frame_scope("telegram:c1") is None
 
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref()) is True
@@ -60,18 +60,18 @@ def test_record_then_get_round_trip(tmp_path):
 
 
 def test_wrong_expected_session_id_rejected(tmp_path):
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.record_working_frame_scope("telegram:c1", "sess-other", _ref()) is False
     assert store.get_working_frame_scope("telegram:c1") is None
 
 
 def test_agent_profile_mismatch_rejected(tmp_path):
-    store, entry = _make_store(tmp_path, profile="liz")
+    store, _entry = _make_store(tmp_path, profile="liz")
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref()) is False
 
 
 def test_revision_regress_rejected(tmp_path):
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref(revision=3))
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref(revision=2)) is False
     assert store.get_working_frame_scope("telegram:c1")["revision"] == 3
@@ -101,7 +101,7 @@ def test_cleared_ack_replaces_current_and_drops_pending(tmp_path):
 
 
 def test_unrelated_reference_rejected(tmp_path):
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref())
     stranger = _ref(session_id="sess-9", revision=7)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", stranger) is False
@@ -132,7 +132,7 @@ def test_get_ignores_scope_from_rotated_session(tmp_path):
 def test_expired_scope_returns_none(tmp_path):
     import time as _time
 
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.record_working_frame_scope(
         "telegram:c1", "sess-1", _ref(expires_at=_time.time() - 60)
     ) is True
@@ -142,7 +142,7 @@ def test_expired_scope_returns_none(tmp_path):
 def test_expired_current_accepts_fresh_lifetime(tmp_path):
     import time as _time
 
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     stale = _ref(revision=5, expires_at=_time.time() - 60)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", stale)
 
@@ -152,7 +152,7 @@ def test_expired_current_accepts_fresh_lifetime(tmp_path):
 
 
 def test_unexpired_current_rejects_new_lifetime_regress(tmp_path):
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref(revision=3))
     stranger = _ref(revision=1, logical_task_id="task-2")
     assert store.record_working_frame_scope("telegram:c1", "sess-1", stranger) is False
@@ -160,7 +160,7 @@ def test_unexpired_current_rejects_new_lifetime_regress(tmp_path):
 
 
 def test_cleared_ack_may_restart_revision_for_new_lifetime(tmp_path):
-    store, entry = _make_store(tmp_path)
+    store, _entry = _make_store(tmp_path)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", _ref(revision=3))
     ack = _ref(revision=1, logical_task_id="task-2", cleared=True)
     assert store.record_working_frame_scope("telegram:c1", "sess-1", ack) is True
@@ -168,7 +168,7 @@ def test_cleared_ack_may_restart_revision_for_new_lifetime(tmp_path):
 
 
 def test_active_profile_keyword_fences_agent_when_origin_profile_missing(tmp_path):
-    store, entry = _make_store(tmp_path, profile=None)
+    store, _entry = _make_store(tmp_path, profile=None)
     foreign = _ref(agent="liz")
     assert store.record_working_frame_scope(
         "telegram:c1", "sess-1", foreign, active_profile="jenna"
