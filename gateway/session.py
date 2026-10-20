@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Any
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
-from gateway.session_identity import transport_profile_of
+from gateway.session_identity import identity_of, transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
@@ -973,6 +973,7 @@ class SessionStore(
         # Phase 3 (no lock): recovery + create + save + DB ops.
         if decision.needs_recover and decision.prev_session_id is None:
             self._route_recover(decision, session_key, source, now)
+        self._adopt_transport_profile(decision, session_key, source)
         create_kwargs = None
         if decision.entry is None:
             create_kwargs = self._route_create(
@@ -990,6 +991,23 @@ class SessionStore(
             origin=source, display_name=decision.entry.display_name,
         )
         return decision.entry
+
+    def _adopt_transport_profile(self, decision: _RouteDecision, session_key: str, source: SessionSource) -> None:
+        """A lane routed before its receiving bot was known adopts the bot a message's identity names
+        (live or restored, never inferred): the routing entry and, now, the sessions row. COALESCE in
+        the row and the None check here mean a known bot is never replaced."""
+        identity = identity_of(source)
+        if decision.entry is None or identity is None or not identity.multiplexed or identity.transport_inferred:
+            return
+        with self._lock:
+            entry = decision.entry
+            if entry.transport_profile is not None:
+                return
+            entry.transport_profile = identity.transport_profile
+            decision.needs_save = True
+            peer_sid, peer_origin, peer_name = entry.session_id, entry.origin, entry.display_name
+        self._record_gateway_session_peer(
+            peer_sid, session_key, peer_origin, display_name=peer_name, transport_profile=identity.transport_profile)
 
     def _apply_route_checks(
         self, session_key: str, checks: Optional[_RouteChecks], force_new: bool,
