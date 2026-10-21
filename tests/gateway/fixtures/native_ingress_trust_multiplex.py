@@ -45,6 +45,18 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
     def rows(sid):
         return list_session_admissions(authority.db, session_id=sid, pending_only=False)
 
+    # The bot each lane is created with, before any later message can fill it in: what the restored
+    # native source names at creation, not what a repair adopts afterwards.
+    from gateway.session_identity import transport_profile_of
+    created_with = {}
+    route_create = runner.session_store._route_create
+
+    def observed_create(decision, session_key, source, *args, **kwargs):
+        created_with.setdefault(session_key, transport_profile_of(source))
+        return route_create(decision, session_key, source, *args, **kwargs)
+
+    runner.session_store._route_create = observed_create
+
     if mode.startswith('recover'):
         saved = json.loads((state / 'multiplex.json').read_text())
         sid = saved['sid']
@@ -97,6 +109,7 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
     assert len(adapter.deliveries) and not primary.deliveries, (adapter.deliveries, primary.deliveries)
     # A lane first created by a plain-text native admission persists its receiving bot, in the routing
     # entry and in the sessions row (a brand-new Telegram DM topic is exactly such a lane).
+    assert created_with[entry.session_key] == 'transport', created_with
     assert entry.transport_profile == 'transport', entry.to_dict()
     assert authority.db.get_session(entry.session_id)['transport_profile'] == 'transport'
     # Runtime's allowed sender is explicitly NOT allowed by this transport.
@@ -143,6 +156,7 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
         if authority.sessions[lane.session_id].task is not None:
             await asyncio.wait_for(authority.sessions[lane.session_id].task, 10)
         assert lane.session_key.endswith(':97317') and lane.session_id != entry.session_id, lane.session_key
+        assert created_with[lane.session_key] == 'transport', created_with
         assert lane.transport_profile == 'transport', lane.to_dict()
         assert authority.db.get_session(lane.session_id)['transport_profile'] == 'transport'
     if mode == 'capture':
