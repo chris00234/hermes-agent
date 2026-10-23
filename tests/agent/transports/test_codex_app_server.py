@@ -96,3 +96,19 @@ def test_stdout_eof_fails_in_flight_request_promptly():
     assert client._pending == {}
     client._fail_pending_requests("codex app-server client is closing")  # idempotent
     client._proc.stdout.close()
+
+
+def test_stdout_eof_is_not_alive_while_the_process_lingers():
+    """A codex whose stdout hit EOF can never answer again even if its process has not exited yet (a
+    shutdown stuck on children): is_alive() must say so, or a turn with no request in flight polls forever."""
+    client = _bare_client()
+    client._proc.poll = Mock(return_value=None)  # the process is still running
+    read_end, write_end = os.pipe()
+    client._proc.stdout = os.fdopen(read_end, "rb")
+    client._reader = threading.Thread(target=client._read_stdout)
+    client._reader.start()
+    assert client.is_alive()
+    os.close(write_end)
+    client._reader.join(timeout=5)
+    assert not client.is_alive()
+    client._proc.stdout.close()

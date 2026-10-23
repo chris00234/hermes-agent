@@ -306,7 +306,8 @@ class CodexAppServerClient:
             return list(self._stderr_lines[-n:])
 
     def is_alive(self) -> bool:
-        return self._proc.poll() is None
+        # A closed stdout (the reader ended) never answers again, even while the process lingers.
+        return self._proc.poll() is None and self._reader.is_alive()
 
     def _send(self, obj: dict) -> None:
         if self._closed:
