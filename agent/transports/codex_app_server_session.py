@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 
 _STDERR_TAIL_LINES = 12  # stderr tail on generic errors: legible, yet enough for a config/auth diagnostic
+# TurnResult.failure_kind: codex itself broke (its login, the app-server process, or the Codex backend after
+# codex's own retries), not this conversation, so the caller may hand the turn to a configured fallback.
+FAILURE_AUTH, FAILURE_TIMEOUT, FAILURE_DISCONNECT, FAILURE_TRANSPORT = "auth", "timeout", "disconnect", "transport"
 _TIER_UNKNOWN = object()  # thread resumed: the tier it carries is not known
 
 # Hermes' tools.terminal.security_mode -> Codex permissions profile id.
@@ -60,6 +63,8 @@ class TurnResult:
     compacted: bool = False
     # Codex likely wedged (turn timeout, dead subprocess, token refresh failure): caller respawns next turn.
     should_retire: bool = False
+    # A codex outage (FAILURE_*); None for every other failure, including a run-budget deadline.
+    failure_kind: Optional[str] = None
 
 
 # Some codex versions stream ``<turn_aborted>`` as raw agentMessage text when an
@@ -168,7 +173,9 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
 # Generic auth words are authoritative only in the primary error. codex writes
 # independent ChatGPT plugin prewarm failures ("HTTP 401 Unauthorized") to stderr,
 # so there they must not mask an unrelated RPC error or timeout (#75167).
-_PRIMARY_ONLY_OAUTH_HINTS = ("401 unauthorized", "unauthorized", "oauth", "auth profile")
+_PRIMARY_ONLY_OAUTH_HINTS = (
+    "401 unauthorized", "unauthorized", "oauth", "auth profile", "not logged in", "sign in again", "token is expired",
+)
 
 _OAUTH_REAUTH_HINT = (
     "Codex authentication failed — your ChatGPT/Codex login looks expired or invalid. Run `codex login` to refresh, "
@@ -183,6 +190,35 @@ def _classify_oauth_failure(primary: str = "", *, stderr: str = "") -> Optional[
     if any(n in primary_l for n in _OAUTH_REFRESH_FAILURE_HINTS + _PRIMARY_ONLY_OAUTH_HINTS):
         return _OAUTH_REAUTH_HINT
     return _OAUTH_REAUTH_HINT if any(n in stderr_l for n in _OAUTH_REFRESH_FAILURE_HINTS) else None
+
+
+# ``codexErrorInfo`` (app-server v2 TurnError) variants that name the Codex backend failing once codex's own
+# retries are spent; the HTTP-shaped ones carry the upstream status.
+_ERROR_INFO_SERVER_FAILURES = frozenset({"internalServerError", "serverOverloaded"})
+_ERROR_INFO_HTTP_FAILURES = frozenset({
+    "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected",
+    "responseTooManyFailedAttempts",
+})
+_HTTP_AUTH_STATUSES = frozenset({401, 403})
+_HTTP_SERVER_ERROR = 500
+
+
+def _error_info_failure_kind(info: Any) -> Optional[str]:
+    """FAILURE_* for a failed turn's ``codexErrorInfo``: a rejected login, or the backend unreachable or failing
+    (no status or 5xx). Context-window, policy, denial, sandbox, bad-request and usage-limit variants are None."""
+    if isinstance(info, str):
+        if info == "unauthorized":
+            return FAILURE_AUTH
+        return FAILURE_TRANSPORT if info in _ERROR_INFO_SERVER_FAILURES else None
+    if not isinstance(info, dict) or len(info) != 1:
+        return None
+    [(variant, detail)] = info.items()
+    if variant not in _ERROR_INFO_HTTP_FAILURES:
+        return None
+    status = detail.get("httpStatusCode") if isinstance(detail, dict) else None
+    if status in _HTTP_AUTH_STATUSES:
+        return FAILURE_AUTH
+    return FAILURE_TRANSPORT if status is None or (isinstance(status, int) and status >= _HTTP_SERVER_ERROR) else None
 
 
 @dataclass
@@ -374,16 +410,29 @@ class CodexAppServerSession:
         return "" if client is None else "\n".join(client.stderr_tail(n))
 
     @staticmethod
-    def _retire(result: TurnResult, error: str) -> None:
+    def _retire(result: TurnResult, error: str, failure_kind: Optional[str] = None) -> None:
         """Record a terminal error and flag the session for respawn on the next turn."""
         result.error = error
         result.should_retire = True
+        result.failure_kind = failure_kind
+
+    def failure_kind_of(self, exc: BaseException) -> Optional[str]:
+        """FAILURE_* for an exception a codex app-server call raised; None when it is no codex outage (a JSON-RPC
+        rejection, a session Hermes closed itself, a programming error)."""
+        if self._closed:
+            return None
+        primary = exc.message if isinstance(exc, CodexAppServerError) else ""
+        if _classify_oauth_failure(primary, stderr=self._stderr_blob(60)) is not None:
+            return FAILURE_AUTH
+        if isinstance(exc, CodexAppServerTransportError):
+            return FAILURE_DISCONNECT
+        return FAILURE_TIMEOUT if isinstance(exc, TimeoutError) else None
 
     def _set_classified_error(self, result: TurnResult, prefix: str, classify_text: str, detail: Any) -> None:
         """OAuth failures -> re-auth hint AND retire (token store broken though JSON-RPC is fine); else stderr tail."""
         hint = _classify_oauth_failure(classify_text, stderr=self._stderr_blob(40))
         if hint is not None:
-            self._retire(result, hint)
+            self._retire(result, hint, FAILURE_AUTH)
         else:
             result.error = self._format_error_with_stderr(prefix, detail)
 
@@ -392,7 +441,8 @@ class CodexAppServerSession:
         try:
             self.ensure_started()
         except (CodexAppServerError, TimeoutError) as exc:
-            self._retire(result, self._format_error_with_stderr("codex app-server startup failed", exc))
+            self._retire(result, self._format_error_with_stderr("codex app-server startup failed", exc),
+                         self.failure_kind_of(exc))
             return False
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
@@ -403,12 +453,13 @@ class CodexAppServerSession:
         try:
             return self._client.request(method, params, timeout=10)
         except CodexAppServerTransportError as exc:
-            self._retire(result, self._format_error_with_stderr(f"{label} failed", exc))
+            self._retire(result, self._format_error_with_stderr(f"{label} failed", exc), self.failure_kind_of(exc))
         except CodexAppServerError as exc:
             self._set_classified_error(result, f"{label} failed", exc.message, exc)
         except TimeoutError as exc:
             hint = _classify_oauth_failure(stderr=self._stderr_blob(40))
-            self._retire(result, hint or self._format_error_with_stderr(f"{label} timed out", exc))
+            self._retire(result, hint or self._format_error_with_stderr(f"{label} timed out", exc),
+                         FAILURE_AUTH if hint else FAILURE_TIMEOUT)
         return None
 
     def _subprocess_died(self, result: TurnResult, client: Optional[CodexAppServerClient]) -> bool:
@@ -425,7 +476,8 @@ class CodexAppServerSession:
         if client.is_alive():
             return False
         hint = _classify_oauth_failure(stderr=self._stderr_blob(60))
-        self._retire(result, hint or self._format_error_with_stderr("codex app-server subprocess exited unexpectedly", tail_lines=20))
+        self._retire(result, hint or self._format_error_with_stderr("codex app-server subprocess exited unexpectedly", tail_lines=20),
+                     FAILURE_AUTH if hint else FAILURE_DISCONNECT)
         return True
 
     def _absorb_notification(
@@ -566,6 +618,12 @@ class CodexAppServerSession:
             if turn_status and turn_status not in {"completed", "interrupted"} and turn_obj.get("error"):
                 err_msg = _format_responses_error(turn_obj["error"], str(turn_status))
                 self._set_classified_error(result, f"turn ended status={turn_status}", err_msg, err_msg)
+                # codex's own classification outranks the text/stderr hint (a stale refresh line in stderr must
+                # not make a context-window failure an outage); absent or "other", the hint stands.
+                info = turn_obj["error"].get("codexErrorInfo") if isinstance(turn_obj["error"], dict) else None
+                if info not in (None, "other"):
+                    result.failure_kind = _error_info_failure_kind(info)
+                    result.should_retire = result.should_retire or result.failure_kind == FAILURE_AUTH
             return True
 
         self._drive_turn(
@@ -608,7 +666,8 @@ class CodexAppServerSession:
                 try:
                     turn_complete = on_server_request(sreq)
                 except CodexAppServerTransportError as exc:
-                    self._retire(result, self._format_error_with_stderr("codex app-server request response failed", exc))
+                    self._retire(result, self._format_error_with_stderr("codex app-server request response failed", exc),
+                                 self.failure_kind_of(exc))
                     break
                 continue
             note = client.take_notification(timeout=notification_poll_timeout)

@@ -1749,14 +1749,34 @@ def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_fail
     return "⚠️ Rate limited — switching to fallback provider..."
 
 
+# ``result["codex_failure"]`` (the session's TurnResult.failure_kind) -> failover reason and status line:
+# the codex login, the app-server process or the Codex backend broke, not this conversation.
+_CODEX_OUTAGES = {
+    "auth": (FailoverReason.auth, "🔐 Codex login failed"),
+    "timeout": (FailoverReason.timeout, "⚠️ Codex app-server timed out"),
+    "disconnect": (FailoverReason.server_error, "⚠️ Codex app-server exited"),
+    "transport": (FailoverReason.server_error, "⚠️ Codex backend unreachable"),
+}
+
+
 def activate_codex_app_server_fallback(agent: Any, result: dict[str, Any]) -> bool:
     """The codex app-server runtime reports a failed turn as ``result["error"]`` text instead of
     raising, so the generic classify -> ``fallback_providers`` chain never saw it (#71633).
-    Classify that text; on a billing / rate-limit verdict activate the configured fallback and
-    return True so the caller re-runs the same user turn on the generic loop."""
+    A codex outage the session classified at its source (``codex_failure``) or a billing /
+    rate-limit verdict on that text activates the configured fallback and returns True so the
+    caller re-runs the same user turn on the generic loop."""
     error = result.get("error")
-    if not error or result.get("interrupted") or not agent._has_pending_fallback():
+    # A stop can land while codex fails for another reason, leaving result["interrupted"] False.
+    stopped = result.get("interrupted") or getattr(agent, "_interrupt_requested", False)
+    if not error or stopped or not agent._has_pending_fallback():
         return False
+    outage = _CODEX_OUTAGES.get(result.get("codex_failure"))
+    if outage is not None:
+        reason, status = outage
+        logger.warning("codex app-server turn failed (%s); activating fallback_providers for this turn",
+                       result["codex_failure"])
+        agent._buffer_diagnostic_status(f"{status} — switching to fallback provider...")
+        return bool(agent._try_activate_fallback(reason=reason))
     classified = classify_api_error(
         RuntimeError(str(error)), provider=getattr(agent, "provider", "") or "", model=getattr(agent, "model", "") or "",
     )
