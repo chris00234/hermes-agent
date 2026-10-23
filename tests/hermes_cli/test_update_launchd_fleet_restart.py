@@ -184,6 +184,20 @@ class TestProbeLaunchdDomainForLabel:
         monkeypatch.setattr(gw.subprocess, "run", fake_run)
         assert _probe_launchd_domain_for_label("ai.hermes.gateway-x") == f"user/{UID}"
 
+    def test_unloaded_label_prefers_live_gui_session_over_background_shell(self, monkeypatch):
+        """SSH (Background) with a console login present must still pick gui/<uid>."""
+        def fake_run(cmd, **kwargs):
+            if cmd == ["launchctl", "print", f"gui/{UID}"]:
+                return _completed(0, "")
+            if cmd[:2] == ["launchctl", "print"]:
+                raise subprocess.CalledProcessError(113, cmd)
+            if cmd == ["launchctl", "managername"]:
+                return _completed(0, "Background\n")
+            raise AssertionError(f"unexpected command {cmd}")
+
+        monkeypatch.setattr(gw.subprocess, "run", fake_run)
+        assert _probe_launchd_domain_for_label("ai.hermes.gateway-x") == f"gui/{UID}"
+
 
 class TestGetServicePidsScoping:
     def _wire(self, monkeypatch):

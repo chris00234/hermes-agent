@@ -51,6 +51,7 @@ def _make_runner():
         chat_type="dm",
     )
     runner.session_store = MagicMock()
+    runner.session_store.get_working_frame_scope.return_value = None
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store.reset_session.return_value = session_entry
     runner.session_store._entries = {session_key: session_entry}

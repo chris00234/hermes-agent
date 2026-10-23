@@ -721,6 +721,11 @@ def _context_files_part(agent: Any, ctx_len: Optional[int], soul_loaded: bool) -
     can reject Hermes's bundled AGENTS.md."""
     if agent.skip_context_files:
         return []
+    if getattr(agent, "api_mode", None) == "codex_app_server":
+        # The codex app-server injects ~/.codex/AGENTS.md and the cwd's AGENTS.md chain itself; loading
+        # them here too sent every project rule twice. SOUL.md is not a Codex input, so it stays.
+        soul = None if soul_loaded else _pb.load_soul_md(ctx_len, home_override=_agent_home(agent))
+        return [soul] if soul else []
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
     cwd = resolve_context_cwd(include_session_override=not launch_artifact)
     return [_pb.build_context_files_prompt(

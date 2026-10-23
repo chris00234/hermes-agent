@@ -107,6 +107,7 @@ from tools.browser_session_lifecycle import cleanup_browser
 from tools.connectors.turn import agent_connection_surface, scoped_connection_surface
 
 from agent.memory_provider import is_trivial_prompt
+from agent.private_execution import private_execution_active
 from agent.client_lifecycle import ClientLifecycleMixin
 from agent.stream_delivery import StreamDeliveryMixin
 from agent.status_output import StatusOutputMixin
@@ -182,6 +183,8 @@ def _review_queue_key(agent: Any) -> str:
 def _notify_context_engine_session_end(agent: Any, messages: Optional[list]) -> None:
     """Tell the context engine the session ended (flush DAG, close DBs) at the same lifecycle moment as the
     memory manager, so per-session engine state never leaks into the next session."""
+    if private_execution_active(agent):
+        return
     engine = getattr(agent, "context_compressor", None)
     if engine:
         _quietly(lambda: engine.on_session_end(agent.session_id or "", messages or []))
@@ -292,7 +295,7 @@ class AIAgent(
         advertised ``session_search`` tool stays usable."""
         # Persistence-isolated forks (background review) must not lazily open the canonical state DB —
         # that would re-arm the flush to write the fork's harness turn into the user's real session.
-        if getattr(self, "_persist_disabled", False):
+        if private_execution_active(self) or getattr(self, "_persist_disabled", False):
             return None
         if self._session_db is not None:
             return self._session_db
@@ -314,7 +317,7 @@ class AIAgent(
 
     def _ensure_db_session(self) -> None:
         """Create the session DB row on first use; a transient failure leaves it to retry next turn."""
-        if getattr(self, "_persist_disabled", False) or self._session_db_created or not self._session_db:
+        if private_execution_active(self) or getattr(self, "_persist_disabled", False) or self._session_db_created or not self._session_db:
             return
         source = session_source_for(self.platform)
         try:
@@ -354,6 +357,8 @@ class AIAgent(
     ) -> None:
         """Drive the context engine's session transition: on_session_end → on_session_reset → on_session_start
         → carry_over_new_session_context. Each hook is optional (the built-in compressor only resets)."""
+        if private_execution_active(self):
+            return
         engine = getattr(self, "context_compressor", None)
         if not engine:
             return
@@ -874,6 +879,8 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
+        if private_execution_active(self):
+            return
         if self._memory_manager and self._memory_manager.claim_teardown(session_end=True):
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -885,6 +892,8 @@ class AIAgent(
     def commit_memory_session(self, messages: list | None = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
+        if private_execution_active(self):
+            return
         if self._memory_manager:
             _quietly(lambda: self._memory_manager.on_session_end(messages or []))
         _notify_context_engine_session_end(self, messages)
@@ -902,7 +911,7 @@ class AIAgent(
         is almost certainly a retry of the same intent, and a prefetch keyed on the interrupted turn would
         fire against stale context. See #15218.
         """
-        if interrupted or not (self._memory_manager and final_response and original_user_message):
+        if private_execution_active(self) or interrupted or not (self._memory_manager and final_response and original_user_message):
             return
         # Flatten multimodal parts to text (newline-joined for memory).
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")

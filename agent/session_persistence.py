@@ -20,6 +20,7 @@ from agent.context_compressor import (
 )
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_context import sanitize_context
+from agent.private_execution import private_execution_active
 
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
@@ -449,6 +450,9 @@ class SessionPersistenceMixin:
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
+        if private_execution_active(self):
+            self._session_messages = messages
+            return
         with _persist_lock(self):
             # Only the scaffolding goes here. Closing a tool tail this uncovers is the exit
             # owner's job (``_close_transcript_tail``, ``abort_turn_on_interrupt``): only it knows
@@ -496,7 +500,7 @@ class SessionPersistenceMixin:
         """
         # Persistence-isolated agents (background review fork) share the parent's session_id for cache warmth;
         # a write here would land the curator's turn in the user's real history.
-        if getattr(self, "_persist_disabled", False) or not self._session_db:
+        if private_execution_active(self) or getattr(self, "_persist_disabled", False) or not self._session_db:
             return None
         batch_rows: list[dict[str, Any]] = []
         try:
@@ -532,7 +536,7 @@ class SessionPersistenceMixin:
 
     def _save_trajectory(self, messages: list[dict[str, Any]], user_query: str, completed: bool):
         """Save conversation trajectory to JSONL file."""
-        if not self.save_trajectories:
+        if private_execution_active(self) or not self.save_trajectories:
             return
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
         _save_trajectory_to_file(trajectory, self.model, completed)

@@ -329,6 +329,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — seisiún tosaithe gan teideal."
     title_empty_untitled: "\n⚠️ Tá an teideal folamh tar éis glanta — seisiún tosaithe gan teideal."
     tip: "\n✦ Leid: {tip}"
+    memory_scope_failed: "Níorbh fhéidir seicphointe na cuimhne a scor; fágadh an seisiún gan athrú. Bain triail eile as i gceann nóiméid."
   restart:
     in_progress: "⏳ Tá atosú gateway ar siúl cheana féin..."
     restarting: "♻ Ag atosú gateway. Mura gcuirfear in iúl duit laistigh de 60 soicind, atosaigh ón gconsól le `hermes gateway restart`."
@@ -508,6 +509,8 @@ gateway:
     nothing: "Níl aon rud le cealú."
     removed: "↩️ Cealaíodh {turns} seal ({count} teachtaireacht).\nCúltacaíodh chuig: \"{preview}\"\nCóipeáil/cuir an téacs thuas in eagar agus seol é chun athleideadh ón áit seo."
     invalid_count: "Líon neamhbhailí \"{arg}\" — úsáid /undo nó /undo N."
+    memory_scope_failed: "Níorbh fhéidir seicphointe na cuimhne a scor; fágadh an seisiún gan athrú. Bain triail eile as i gceann nóiméid."
+    frame_reset_without_rewind: "Athshocraíodh seicphointe na cuimhne, ach níorbh fhéidir aon seal comhrá a bhaint — níor athraíodh an tras-scríbhinn."
   update:
     platform_not_messaging: "✗ Tá /update ar fáil amháin ó ardáin teachtaireachtaí. Rith `hermes update` ón teirminéal."
     not_git_repo: "✗ Ní stór git é seo — ní féidir nuashonrú."

@@ -1818,12 +1818,24 @@ class GatewayAdapterLifecycleMixin:
     def _multiplex_on(self) -> bool:
         return bool(getattr(self.config, "multiplex_profiles", False))
 
-    async def _handle_gateway_platform_event(self, event: dict, source) -> None:
+    async def _handle_gateway_platform_event(self, event: dict, source):
         """Authorize and publish one normalized adapter event to plugin hooks."""
         # Observer failures must never break the adapter's update loop.
         with _log_suppressed(logging.DEBUG, "gateway_platform_event hook dispatch failed", exc_info=True):
             from hermes_cli.lifecycle import has_hook, invoke_hook
-            if has_hook("gateway_platform_event") and self._is_user_authorized_for_source(source):
+            if not self._is_user_authorized_for_source(source):
+                return None
+            if event.get("event_type") in {
+                "clarify_original_candidate", "clarify_original_edited", "clarify_callback_candidate",
+            }:
+                from gateway.telegram_clarify_evidence import authorize_candidate
+
+                try:
+                    return authorize_candidate(event, source)
+                except Exception as exc:
+                    logger.warning("Clarify evidence authorization failed: %s", type(exc).__name__)
+                    return None
+            if has_hook("gateway_platform_event"):
                 invoke_hook("gateway_platform_event", **event)
 
     def _make_profile_platform_event_handler(self, profile_name: str):

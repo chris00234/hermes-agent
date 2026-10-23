@@ -384,7 +384,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # they can retry; on timeout the agent unblocks with an empty response.
         if not _raw_clarify_reply or _raw_clarify_reply.startswith("/"):
             return None
-        _text_outcome = _clarify_mod.attempt_text_response_for_session(_quick_key, _raw_clarify_reply)
+        from tools.clarify_evidence import selected_for_event
+
+        _text_outcome = _clarify_mod.attempt_text_response_for_session(
+            _quick_key, _raw_clarify_reply,
+            selected_reply=selected_for_event(event, _raw_clarify_reply),
+        )
         if _text_outcome == _clarify_mod.TEXT_RESOLVED:
             logger.info(
                 "Gateway intercepted clarify text response (session=%s, id=%s)",

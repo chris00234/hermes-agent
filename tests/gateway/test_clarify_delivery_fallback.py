@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.config import Platform
+from gateway.session import SessionSource
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from tools import clarify_gateway as cm
 
@@ -75,6 +77,7 @@ def _runner(adapter, loop, monkeypatch, timeout=5):
 
     runner = object.__new__(TurnRunner)
     runner._ctx = SimpleNamespace(
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="42"),
         _status_adapter=adapter, _status_chat_id="42", _status_thread_metadata=None,
         session_key="sk-fallback", stream_consumer_holder=[None], _loop_for_step=loop)
     runner._close_native_stream_boundary = lambda *a, **k: None

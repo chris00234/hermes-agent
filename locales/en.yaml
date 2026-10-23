@@ -333,6 +333,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — session started untitled."
     title_empty_untitled: "\n⚠️ Title is empty after cleanup — session started untitled."
     tip: "\n✦ Tip: {tip}"
+    memory_scope_failed: "Memory checkpoint could not be retired; the session was left unchanged. Try again in a moment."
   restart:
     in_progress: "⏳ Gateway restart already in progress..."
     restarting: "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
@@ -512,6 +513,8 @@ gateway:
     nothing: "Nothing to undo."
     removed: "↩️ Undid {turns} turn(s) ({count} message(s)).\nBacked up to: \"{preview}\"\nCopy/edit the text above and send it to re-prompt from here."
     invalid_count: "Invalid count \"{arg}\" — use /undo or /undo N."
+    memory_scope_failed: "Memory checkpoint could not be retired; the session was left unchanged. Try again in a moment."
+    frame_reset_without_rewind: "The memory checkpoint was reset, but no conversation turn could be removed — the transcript is unchanged."
   update:
     platform_not_messaging: "✗ /update is only available from messaging platforms. Run `hermes update` from the terminal."
     not_git_repo: "✗ Not a git repository — cannot update."

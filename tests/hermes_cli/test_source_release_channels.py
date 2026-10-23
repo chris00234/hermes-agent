@@ -302,3 +302,34 @@ def test_default_stable_only_moves_forward_until_the_channel_is_chosen(releases,
     set_install_channel("stable", releases.root)
     update_cmd._cmd_update_impl(SimpleNamespace(branch=None, channel=None, force_venv=True), False)
     assert git(releases.root, "rev-parse", "HEAD") == releases.commits[1]
+
+
+def test_custom_branch_on_official_origin_keeps_its_commits(releases, monkeypatch, tmp_path):
+    """An unconfigured official checkout on its own branch follows main in place, never a release."""
+    from hermes_cli.update_channel import default_channel
+
+    _track_official_origin(releases)
+    git(releases.root, "checkout", "-b", "managed-main", releases.commits[0])
+    (releases.root / "carried.txt").write_text("carried", encoding="utf-8")
+    git(releases.root, "add", "carried.txt")
+    git(releases.root, "commit", "-m", "carried patch")
+    carried = git(releases.root, "rev-parse", "HEAD")
+    assert default_channel(releases.root) == "main"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("updates:\n  parked_branch_strategy: update_in_place\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    opts = update_cmd._UpdateOptions(
+        pre_update_version=None, gw_input_fn=None,
+        assume_yes=True, keep_stash=False, switch_branch=False, discard_local_changes=False,
+    )
+    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *_: opts)
+    monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda *_: None)
+    monkeypatch.setattr(main, "_run_pre_update_backup", lambda *_: None)
+    monkeypatch.setattr(main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda **_: (False, ["git"], False))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: None)
+    update_cmd._cmd_update_impl(SimpleNamespace(branch=None, channel=None, force_venv=True), False)
+    assert git(releases.root, "branch", "--show-current") == "managed-main"
+    for kept in (carried, releases.commits[3]):
+        git(releases.root, "merge-base", "--is-ancestor", kept, "HEAD")

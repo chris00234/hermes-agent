@@ -83,7 +83,7 @@ These four Hermes tools require the running AIAgent context (mid-loop state) to 
 
 **Works on this runtime.** Goals persist in `state_meta` keyed by session id, the continuation prompt feeds back as a normal user message through `run_conversation()`, and codex executes the next turn natively. The goal judge runs via the auxiliary client (configured via `auxiliary.goal_judge` in config.yaml), independent of which runtime is active. The judge's "blocked, needs user input" verdict is a clean escape if codex stalls on approvals.
 
-**One thing to be aware of:** each continuation prompt is a fresh codex turn, which means codex re-evaluates command approval policy from scratch. If you're doing a long-running goal with lots of writes, expect more approval prompts than you'd see on a single in-session task. Set `default_permissions = ":workspace"` (which Hermes does automatically when you enable the runtime) so simple workspace writes don't require prompting.
+**One thing to be aware of:** each continuation prompt is a fresh codex turn, which means codex re-evaluates command approval policy from scratch. If you're doing a long-running goal with lots of writes, expect more approval prompts than you'd see on a single in-session task. Hermes preserves your native Codex permission settings; only when none are configured does migration add `default_permissions = ":workspace"` so simple workspace writes don't require prompting.
 
 ### Kanban (multi-agent worktree dispatch)
 
@@ -126,7 +126,8 @@ The kanban tools are gated by `HERMES_KANBAN_TASK` env var the dispatcher sets �
 | Model selection (`model.default`, `/model`) | yes | yes — sent on `thread/start` and every `turn/start`, so a mid-session `/model` applies to the next turn; a `-900k` variant goes out as its base slug (codex applies the extended window itself), and on codex's own provider an `openai/` prefix is dropped |
 | Reasoning effort and `/fast` | yes | yes — an explicit `reasoning_effort` (clamped to what the model accepts; `ultra` goes out as codex's own Ultra mode on models whose ladder reaches `max`; disabled reasoning goes out as `none`) and `/fast` ride on `turn/start`; without a Hermes setting, codex's own configured defaults apply |
 | Native Codex plugins (Linear, GitHub, etc.) | — | yes (auto-migrated) |
-| User MCP servers | yes | yes (auto-migrated to codex) |
+| User MCP servers | yes | yes (auto-migrated to codex; each one the profile declares runs under the profile's `HERMES_HOME`) |
+| Memory-provider recall, `pre_llm_call` hook context, gateway notes in the user turn | yes | yes — sent in the `turn/start` input and persisted as the row's `api_content` |
 | Memory + skill review (background) | yes | yes (via item projection) |
 | System prompt / SOUL.md / channel `system_prompt` overrides | yes | yes (sent once as developer instructions on thread start) |
 | Multi-turn conversations | yes | yes |
@@ -215,7 +216,7 @@ That command:
 - Migrates user MCP servers from `~/.hermes/config.yaml` to `~/.codex/config.toml`.
 - **Discovers and migrates installed native Codex plugins** (Linear, GitHub, Gmail, Calendar, Canva, etc.) by querying Codex's `plugin/list` RPC.
 - **Registers Hermes' own tools as an MCP server** so the codex subprocess can call back for tools codex doesn't ship with.
-- **Writes `default_permissions = ":workspace"`** so the sandbox allows writes within the workspace without prompting for every operation.
+- **Preserves native Codex permissions**, including `default_permissions`, `sandbox_mode`, and `approval_policy`. Only configs without native permission settings receive the safe `default_permissions = ":workspace"` fallback.
 - Tells you what was migrated. Takes effect on the **next** session — the current cached agent keeps the prior runtime so prompt caches stay valid.
 
 Synonyms: `/codex-runtime on`, `/codex-runtime off`, `/codex-runtime auto`.
@@ -296,16 +297,25 @@ For `apply_patch` (file edit) approvals, Hermes shows a summary of what changed 
 
 Codex has three built-in permission profiles:
 - `:read-only` — no writes; every shell command requires approval
-- `:workspace` — writes within the current workspace allowed without prompts (Hermes' default when you enable the runtime)
+- `:workspace` — writes within the current workspace allowed without prompts (Hermes' fallback only when no native permissions are configured)
 - `:danger-no-sandbox` — no sandbox at all (don't use this unless you understand it)
 
-You can override the default in `~/.codex/config.toml` outside Hermes' managed block:
+You can edit the existing top-level default in `~/.codex/config.toml` (do not add a duplicate key):
 
 ```toml
 default_permissions = ":read-only"
 ```
 
-(Hermes will preserve your override on re-migration as long as it lives outside the `# managed by hermes-agent` markers.)
+Hermes preserves existing native permission values on re-migration, even if you edited
+`default_permissions` inside the `# managed by hermes-agent` markers. Settings recovered
+from the managed block are moved outside it. Native legacy settings such as
+`sandbox_mode = "danger-full-access"` with `approval_policy = "never"` are left unchanged;
+migration does not add a competing workspace selector. Named `[permissions]` profiles and
+`[sandbox_workspace_write]` settings also suppress the fallback.
+
+For Python callers, `migrate(default_permission_profile=...)` supplies a fallback, not an
+override of existing native settings. `None` disables creation of a fallback without
+removing existing permissions. Migration never enables full access by default.
 
 ## Auxiliary tasks and ChatGPT subscription token cost
 
@@ -354,7 +364,9 @@ Anything **outside** that block is yours. Re-running migration (via `/codex-runt
 - Configure codex-only options (model, providers, otel, etc.)
 - Add user-defined permission profiles in `[permissions.<name>]` tables
 
-Anything you add **inside** the managed block will get clobbered on the next migration. If you need a tweak that requires editing the managed block, file an issue and we'll add the knob.
+MCP and plugin entries **inside** the managed block are regenerated on the next migration.
+Native permission settings are the exception: their values are preserved, including edits
+to the generated `default_permissions` line.
 
 **Same-name servers.** If your own `[mcp_servers.<name>]` table (outside the block) uses the same name as a server in Hermes' `mcp_servers`, your table wins: Hermes skips its projection for that name instead of emitting a second `[mcp_servers.<name>]` header (which is invalid TOML and would stop codex from starting). The migration report lists such names under "Kept N user-owned MCP server(s)". To let Hermes manage the server, delete your table and re-run the migration. The rendered file is parsed as TOML before it replaces `config.toml`; an unparsable result is reported and the existing file is left untouched.
 
@@ -409,6 +421,8 @@ What translates:
 
 What's not migrated:
 - Hermes-specific keys like `sampling` (Codex's MCP client has no equivalent — these are dropped with a per-server warning).
+
+Codex launches these servers from the shared `config.toml`, so profile-level tool filters (`tools.include`) and `enabled` flags are not applied per profile to the servers it launches; each stdio server the active profile declares (and the codex config defines) does run under that profile's `HERMES_HOME`.
 
 ## Native Codex plugin migration
 

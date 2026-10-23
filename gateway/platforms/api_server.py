@@ -131,7 +131,88 @@ from gateway.readiness import collect_runtime_readiness
 from gateway.parked_route_refusal import ParkedRouteRefused
 from gateway.platforms._shared import coerce_port as _coerce_port, get_scoped_secret as _get_scoped_secret
 from gateway.platforms.tcp_site import start_tcp_site
+from gateway.private_execution_policy import (
+    ALWAYS_EXCLUDED_TOOLSETS as _PRIVATE_ALWAYS_EXCLUDED_TOOLSETS,
+    PrivateExecutionPolicy,
+    bind_private_policy as _bind_private_policy,
+    current_private_policy as _current_private_policy,
+    reset_private_policy as _reset_private_policy,
+)
 from hermes_state_errors import SessionActiveWriteGuardError
+
+# The private-execution grant header is honored ONLY on POST /v1/runs
+# (DE_DESIGN §1.1 #25); every other endpoint 400-rejects it.
+_PRIVATE_GRANT_HEADER = "X-Hermes-Private-Grant"
+
+_PRIVATE_ENGINE_GUARD_LOCK = threading.Lock()
+_private_engine_guard_installed = False
+
+
+def _ensure_private_context_engine_guard() -> None:
+    """Force the built-in context compressor for policy-bound constructions.
+
+    ``agent_init`` selects a plugin context engine purely from config
+    (``context.engine``, agent_init.py engine selection) — there is no
+    constructor kwarg. Wrap both loaders with ContextVar-aware guards so a
+    construction running under a bound private policy never builds (or
+    triggers discovery of) a plugin engine, while concurrent public
+    constructions delegate to the originals untouched (DE_DESIGN §1.1 #8).
+    """
+    global _private_engine_guard_installed
+    with _PRIVATE_ENGINE_GUARD_LOCK:
+        if _private_engine_guard_installed:
+            return
+        import plugins.context_engine as _ce_mod
+        from hermes_cli import plugins as _plugins_mod
+
+        _orig_load = _ce_mod.load_context_engine
+        _orig_get = _plugins_mod.get_plugin_context_engine
+
+        def _guarded_load_context_engine(name):
+            if _current_private_policy() is not None:
+                return None
+            return _orig_load(name)
+
+        def _guarded_get_plugin_context_engine():
+            if _current_private_policy() is not None:
+                return None
+            return _orig_get()
+
+        _ce_mod.load_context_engine = _guarded_load_context_engine
+        _plugins_mod.get_plugin_context_engine = _guarded_get_plugin_context_engine
+        _private_engine_guard_installed = True
+
+
+def _construct_private_agent(
+    agent_cls: Any,
+    agent_kwargs: dict[str, Any],
+    policy: PrivateExecutionPolicy,
+) -> Any:
+    """Build a policy-fenced AIAgent (DE_DESIGN §4 bind points 5-6).
+
+    The ContextVar is bound around construction (belt-and-braces beside the
+    caller's bind) so construction-time code — including the context-engine
+    guard — observes the policy, then reset; post-construction flags follow
+    the background_review.py fork precedent. The stamped
+    ``_private_execution_policy`` attribute is the frozen policy object.
+    """
+    _ensure_private_context_engine_guard()
+    token = _bind_private_policy(policy)
+    try:
+        agent = agent_cls(**agent_kwargs)
+    finally:
+        try:
+            _reset_private_policy(token)
+        except Exception:
+            logger.warning("private policy ContextVar reset failed", exc_info=True)
+    agent._persist_disabled = True
+    agent._session_json_enabled = False
+    agent._end_session_on_close = False
+    # launchd captures gateway stdout: _vprint(force=True)/_emit_status lines
+    # bypass quiet_mode, so silence them like the background-review fork does.
+    agent.suppress_status_output = True
+    agent._private_execution_policy = policy
+    return agent
 
 
 logger = logging.getLogger(__name__)
@@ -1369,8 +1450,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "forwarded_for": self._clean_log_value(request.headers.get("X-Forwarded-For", "")),
             "real_ip": self._clean_log_value(request.headers.get("X-Real-IP", "")),
             "method": self._clean_log_value(request.method, max_len=16),
-            "path": self._clean_log_value(request.path_qs, max_len=500),
-            "user_agent": self._clean_log_value(request.headers.get("User-Agent", ""), max_len=300)}
+            # Scrubbed: a query-delivered private grant must never reach
+            # the audit log — the 401 warning fires before any handler-level
+            # rejection can run (DE_DESIGN sink #24).
+            "path": self._clean_log_value(
+                _api_runs._scrub_private_grant_qs(request.path_qs), max_len=500
+            ),
+            "user_agent": self._clean_log_value(request.headers.get("User-Agent", ""), max_len=300),
+        }
+
 
     def _request_audit_log_suffix(self, request: web.Request) -> str:
         ctx = self._request_audit_context(request)
@@ -1555,10 +1643,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if profile is _PROFILE_REJECTED:
                 return web.json_response({"error": "Unknown or unconfigured profile"}, status=404)
             token = _api_request_profile.set(profile)
+            # Default-deny seed: no handler runs with an inherited/stale
+            # private policy; only /v1/runs admission mints one (DE_DESIGN
+            # §4 bind point 1). Authority is never finalized here (pre-auth).
+            private_seed_token = _bind_private_policy(None)
             try:
                 with self._profile_scope(profile):
                     return await handler(request)
             finally:
+                _reset_private_policy(private_seed_token)
                 _api_request_profile.reset(token)
         return profile_prefix_middleware
 
@@ -2198,7 +2291,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[dict[str, Any]] = None, route: Optional[dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[dict[str, Any]] = None,
-        room_execution_policy: Optional[dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[dict[str, Any]] = None,
+        private_execution_policy: Optional[PrivateExecutionPolicy] = None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2225,6 +2319,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             requested_model=requested_model, requested_provider=requested_provider, route=route,
             session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
             gateway_session_key=gateway_session_key, session_id=session_id)
+        if private_execution_policy is not None and runtime_kwargs.get("api_mode") == "codex_app_server":
+            raise RuntimeError("Private execution does not support codex_app_server")
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``
@@ -2237,13 +2333,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        if private_execution_policy is not None:
+            # Clamp to the grant AND the platform's configured tools; the
+            # always-excluded set can never re-enter (DE_DESIGN §1.1 #4/#28).
+            enabled_toolsets = sorted(
+                (set(enabled_toolsets) & set(private_execution_policy.allowed_toolsets))
+                - _PRIVATE_ALWAYS_EXCLUDED_TOOLSETS
+            )
+
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
             request_reasoning_config = GatewayRunner._load_reasoning_config(model)
+        private_run = private_execution_policy is not None
         agent_kwargs = {
-            "model": model, **runtime_kwargs, **_checkpoint_agent_kwargs(user_config),
-            "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
+            "model": model,
+            **runtime_kwargs,
+            # Private runs drop the checkpoint kwarg merge entirely
+            # (DE_DESIGN §1.1 #6).
+            **({} if private_run else _checkpoint_agent_kwargs(user_config)),
+            "max_iterations": max_iterations,
+            "quiet_mode": True,
+            "verbose_logging": False,
+
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets, "session_id": session_id,
             "platform": "api_server",
@@ -2254,17 +2366,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "interim_assistant_callback": interim_assistant_callback,
             "reasoning_callback": reasoning_callback,
             "status_callback": status_callback,
-            "session_db": self._ensure_session_db(),
+            # Never open the profile state.db for a private run (#1).
+            "session_db": None if private_run else self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
             "reasoning_config": request_reasoning_config,
             "gateway_session_key": gateway_session_key,
             # The session's provider from the previous request, so its queued recall reaches this turn
             # (#120116); checked back in by the turn's finally.
-            "memory_manager": self._memory_sessions.checkout(session_id)}
+            "memory_manager": None if private_run else self._memory_sessions.checkout(session_id),
+        }
+        if private_run:
+            agent_kwargs.update(
+                skip_memory=True,
+                skip_background_review=True,
+                save_trajectories=False,
+                checkpoints_enabled=False,
+            )
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
-        agent = AIAgent(**agent_kwargs)
+
+        if private_run:
+            agent = _construct_private_agent(
+                AIAgent, agent_kwargs, private_execution_policy
+            )
+        else:
+            agent = AIAgent(**agent_kwargs)
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
@@ -2274,6 +2401,30 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "model": getattr(agent, "model", None) or model,
             "route_source": route_source}
         return agent
+
+    def _reject_stray_private_grant(
+        self, request: "web.Request"
+    ) -> Optional["web.Response"]:
+        """400-reject a private grant delivered off the /v1/runs lane.
+
+        No private policy can exist outside the runs lane (DE_DESIGN §4
+        bind point 3); honoring the header anywhere else would be sink #25.
+        A query-delivered grant is scanned case-insensitively too: the
+        MultiDict is case-sensitive and a silently-ignored grant would leak
+        into the path_qs audit log.
+        """
+        if (
+            _PRIVATE_GRANT_HEADER not in request.headers
+            and not _api_runs._query_carries_private_grant(request)
+        ):
+            return None
+        return web.json_response(
+            _openai_error(
+                f"{_PRIVATE_GRANT_HEADER} is honored only on POST /v1/runs",
+                code="private_grant_not_allowed",
+            ),
+            status=400,
+        )
 
     # -- HTTP handlers ----------------------------------------------------------------
 
@@ -3054,6 +3205,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_session_chat(self, request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
         # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
         # Spending the budget without checking it refused every other caller while never
@@ -3099,6 +3253,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         limited = self._concurrency_limited_response()
         if limited is not None:
             return limited
@@ -3448,6 +3605,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_run_job(self, request: web.Request) -> web.Response:
         """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         job_id, err = self._cron_request_guard(request, need_job_id=True, check_draining=True)
         if err:
             return err
@@ -3471,6 +3631,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a
         NAS-minted JWT via the pluggable verifier, NOT API_SERVER_KEY. 202 + background run so
         a long turn never trips NAS's timeout; the store CAS claim guards double-fire on retry."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         # Startup-wait budget starts here so a slow JWKS fetch cannot outlast the forwarder timeout.
         received_at = asyncio.get_running_loop().time()
         from hermes_cli.config import cfg_get, load_config
@@ -3902,6 +4065,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _api_runs._release_run_owner_if_forgotten(self, run_id)
 
     _handle_get_run = _run_route_delegate("_handle_get_run")
+    _handle_run_lease = _run_route_delegate("_handle_run_lease")
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_run_clarify = _run_route_delegate("_handle_run_clarify")

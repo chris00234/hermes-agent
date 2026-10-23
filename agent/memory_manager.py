@@ -6,7 +6,6 @@ registered at a time (tool-schema bloat, conflicting backends).
 
 from __future__ import annotations
 
-import contextvars
 import inspect
 import json
 import logging
@@ -25,7 +24,11 @@ from agent.memory_caller_scope import bound_scope, caller_scope, claim_instance,
 from agent.memory_context import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_lifecycle import MemoryLifecycle
+from agent.memory_provider import (
+    MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, PRE_SESSION_RESET_API_VERSION,
+    ctx_bound, sanitize_working_frame_reference, spawn_context_thread,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -40,6 +43,11 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# Deadline for the /reset //undo working-frame retirement (an HTTP round-trip
+# behind queued FIFO writes). Longer than the default lifecycle wait, and
+# fail-closed: on timeout the queued retirement is abandoned, never run late.
+_PRE_SESSION_RESET_TIMEOUT_S = 9.0
+
 # A background provider call (sync_turn / queue_prefetch) running longer than this is treated as
 # stuck. Well above the shutdown drain bound and the prefetch timeout so a slow-but-healthy backend
 # is never counted.
@@ -225,6 +233,8 @@ class MemoryManager:
         # Futures by durability class ("write" / "prefetch") so shutdown can drain FIFO
         # within a bound, then report exactly what it abandoned.
         self._background_futures: dict[Future, str] = {}
+        self._memory_lifecycle = MemoryLifecycle(self._submit_background)
+        self._working_frame_scope_sink: Optional[Callable[[dict[str, Any]], Any]] = None
         self._shutting_down = False
         self._teardown_claim: Optional[str] = None  # see claim_teardown()
         self._shutdown_drain_state: dict[str, Any] = {
@@ -245,6 +255,24 @@ class MemoryManager:
             except Exception as e:
                 logger.log(level, "Memory provider '%s' %s: %s", provider.name, label, e, exc_info=exc_info)
         return results
+
+    def set_working_frame_scope_sink(self, sink: Callable[[dict[str, Any]], Any]) -> None:
+        """Bind the host's durable metadata writer before dispatching turns."""
+        if not callable(sink):
+            raise TypeError("Working frame scope sink must be callable")
+        self._working_frame_scope_sink = sink
+
+    def _record_working_frame_scope(self, provider: MemoryProvider) -> None:
+        if self._working_frame_scope_sink is None:
+            return
+        getter = getattr(provider, "working_frame_reference", None)
+        reference = sanitize_working_frame_reference(getter()) if callable(getter) else None
+        if reference is None:
+            return
+        if reference["provider"] != provider.name:
+            raise ValueError("Working frame reference provider mismatch")
+        if self._working_frame_scope_sink(reference) is False:
+            raise RuntimeError("Working frame scope was not durably acknowledged")
 
     def _owner_allows(self, hook: str) -> bool:
         """Whether a lifecycle hook may reach the providers: only from the profile they were initialized
@@ -335,8 +363,13 @@ class MemoryManager:
 
     def build_system_prompt(self) -> str:
         """Join every provider's non-empty ``system_prompt_block()`` with blank lines."""
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return ""
         blocks = self._each_provider("system_prompt_block() failed", lambda p: p.system_prompt_block(),
                                       level=logging.WARNING)
+        if self._memory_lifecycle.read_generation() != generation:
+            return ""
         return "\n\n".join(b for b in blocks if b and b.strip())
 
     # A /skill or /bundle turn embeds the whole skill body in the model-facing message;
@@ -345,6 +378,9 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
@@ -352,6 +388,8 @@ class MemoryManager:
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
+        if self._memory_lifecycle.read_generation() != generation:
+            return ""
         return "\n\n".join(p for p in parts if p and p.strip())
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
@@ -407,8 +445,10 @@ class MemoryManager:
         return result
 
     def describe_recall(self) -> str:
-        """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.
-        Call right after :meth:`prefetch_all` so the user SEES memory was used even if the model is silent."""
+        """Deterministic recall indicator line; empty during incomplete session transitions."""
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return ""
         segments: list[str] = []
         for status in self._each_provider("recall_status failed (non-fatal)", lambda p: p.recall_status()):
             if status is None:
@@ -417,20 +457,27 @@ class MemoryManager:
             detail = ("recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
                       if status.count > 1 else "recalled relevant memory")
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
-        return "  ".join(segments)
+        return "  ".join(segments) if self._memory_lifecycle.read_generation() == generation else ""
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
+        generation = self._memory_lifecycle.generation()
         providers = list(self._providers)
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query or not self._owner_allows("queue_prefetch"):
             return
         clean_query = _redact_for_provider(clean_query)
-        self._submit_background(lambda: self._each_provider(
-            "queue_prefetch failed (non-fatal)",
-            lambda p: self._call_unless_stalled(p, lambda: p.queue_prefetch(clean_query, session_id=session_id)),
-            providers=providers,
-        ), kind="prefetch")
+
+        def _run() -> None:
+            if not self._memory_lifecycle.accepts_background(generation):
+                return
+            self._each_provider(
+                "queue_prefetch failed (non-fatal)",
+                lambda p: self._call_unless_stalled(p, lambda: p.queue_prefetch(clean_query, session_id=session_id)),
+                providers=providers,
+            )
+
+        self._submit_background(_run, kind="prefetch")
 
     @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:
@@ -451,10 +498,12 @@ class MemoryManager:
         (tool outputs included) go through ``_redact_for_provider`` so secrets are never archived
         verbatim in a provider's store (#115104).
         """
+        generation = self._memory_lifecycle.generation()
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content or not self._owner_allows("sync_turn"):
             return
+        messages = list(messages) if messages is not None else None
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
@@ -464,18 +513,23 @@ class MemoryManager:
             for keyword, value in optional_kwargs.items():
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
-            self._call_unless_stalled(
-                provider, lambda: provider.sync_turn(clean_user_content, assistant_content, **kwargs))
+            def _sync_and_record() -> None:
+                provider.sync_turn(clean_user_content, assistant_content, **kwargs)
+                self._record_working_frame_scope(provider)
 
-        self._submit_background(
-            lambda: self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
-        )
+            self._call_unless_stalled(provider, _sync_and_record)
 
-    def _submit_background(self, fn, *, kind: str = "write") -> None:
+        def _run() -> None:
+            if self._memory_lifecycle.accepts_background(generation):
+                self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
+
+        self._submit_background(_run)
+
+    def _submit_background(self, fn, *, kind: str = "write", inline_fallback: bool = True) -> Optional[Future]:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
         durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
-        unavailable outside shutdown, run inline — the historical fail-safe."""
-        fn = ctx_bound(in_owner_home(self._bound_scope, fn))
+        unavailable, only best-effort callers may fall back inline; lifecycle calls fail closed."""
+        fn = ctx_bound(in_owner_home(self._bound_scope, partial(self._memory_lifecycle.run_worker, fn)))
         executor = None if self._shutting_down else self._sync_executor
         if executor is None and not self._shutting_down:
             with self._sync_executor_lock:
@@ -499,12 +553,16 @@ class MemoryManager:
                     future = executor.submit(fn)
                     self._background_futures[future] = kind
         except RuntimeError:
+            if not inline_fallback:
+                return None
             if self._shutting_down:
                 logger.warning("Memory manager shut down during %s submission; task rejected", kind)
                 return
         if future is not None:
             future.add_done_callback(self._forget_background_future)
-            return
+            return future
+        if not inline_fallback:
+            return None
         try:
             fn()
         except Exception as e:  # pragma: no cover - fn guards internally
@@ -588,6 +646,10 @@ class MemoryManager:
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
+        generation = self._memory_lifecycle.read_generation()
+        if generation is None:
+            return tool_error("Memory provider context is unavailable during an incomplete session transition")
+
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
@@ -608,10 +670,65 @@ class MemoryManager:
             record_provider_memory_call(provider.name, tool_name, args, raised=True)
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
         record_provider_memory_call(provider.name, tool_name, args, result)
+        if self._memory_lifecycle.read_generation() != generation:
+            return tool_error("Memory provider session changed during this call")
         return result
 
+    # -- Lifecycle hooks -----------------------------------------------------
+
+    def supports_pre_session_reset(self) -> bool:
+        return any(
+            type(getattr(provider, "pre_session_reset_api_version", None)) is int
+            and provider.pre_session_reset_api_version >= PRE_SESSION_RESET_API_VERSION
+            for provider in self._providers
+        )
+
+    def on_pre_session_reset(
+        self, session_id: str, *, reference: dict[str, Any], rewound: bool = False,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Wait for FIFO provider retirement and durable scope persistence.
+
+        ``timeout`` caps (never extends) the fixed retirement deadline so the
+        abandonment fence engages no later than the caller's own fail-closed
+        deadline; ``timeout <= 0`` rejects retirement before admission.
+        """
+        if not self._owner_allows("on_pre_session_reset"):
+            raise RuntimeError("Memory pre-session reset refused; caller profile does not own the provider")
+        frozen = sanitize_working_frame_reference(reference)
+        if frozen is None or frozen["session_id"] != session_id:
+            raise ValueError("Pre-session reset reference session mismatch")
+        provider = self.get_provider(frozen["provider"])
+        version = getattr(provider, "pre_session_reset_api_version", None)
+        if provider is None or type(version) is not int or version < PRE_SESSION_RESET_API_VERSION:
+            raise RuntimeError("No active memory provider supports pre-session reset")
+
+        def _run() -> dict[str, Any]:
+            acknowledged = sanitize_working_frame_reference(provider.on_pre_session_reset(
+                session_id, reference=dict(frozen), rewound=rewound,
+            ))
+            if acknowledged is None or not acknowledged["cleared"]:
+                raise RuntimeError("Pre-session reset did not acknowledge a cleared frame")
+            if any(acknowledged[key] != frozen[key] for key in
+                   ("provider", "principal", "agent", "project", "session_id")):
+                raise RuntimeError("Pre-session reset acknowledgement scope mismatch")
+            replayed = frozen["cleared"] and acknowledged == frozen
+            if not replayed and acknowledged["revision"] <= frozen["revision"]:
+                raise RuntimeError("Pre-session reset acknowledgement revision did not advance")
+            if self._working_frame_scope_sink is not None:
+                if self._working_frame_scope_sink(acknowledged) is False:
+                    raise RuntimeError("Working frame scope was not durably acknowledged")
+            return acknowledged
+
+        wait = _PRE_SESSION_RESET_TIMEOUT_S
+        if timeout is not None:
+            wait = max(0.0, min(wait, timeout))
+        return self._memory_lifecycle.call(
+            _run, transition=True, required=True, timeout=wait,
+        )
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        if not self._owner_allows("on_turn_start"):
+        if not self._owner_allows("on_turn_start") or self._memory_lifecycle.read_generation() is None:
             return
         message = _redact_for_provider(message)
 
@@ -644,8 +761,7 @@ class MemoryManager:
         Submitting BOTH hooks as one task on the manager's single background worker gives both properties at
         a single chokepoint: the caller returns immediately, and the worker's FIFO order serializes
         end→switch against every other provider write (per-turn ``sync_all``, prefetches), which already
-        share the same worker. If the executor is unavailable, ``_submit_background`` degrades to inline
-        execution — the pre-#16454 synchronous behavior, slow but correct.
+        share the same worker. If the executor is unavailable, lifecycle admission fails closed.
         """
         if not self._providers or not self._owner_allows("session_boundary"):
             return
@@ -657,11 +773,12 @@ class MemoryManager:
             except Exception as e:  # pragma: no cover
                 logger.warning("Session-boundary extraction failed: %s", e)
             try:
-                self.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=True, reason=reason)
-            except Exception as e:  # pragma: no cover
+                self._notify_session_switch(new_session_id, parent_session_id=parent_session_id, reset=True, reason=reason)
+            except Exception as e:
                 logger.warning("Session-boundary switch failed: %s", e)
+                raise
 
-        self._submit_background(_run)
+        self._memory_lifecycle.enqueue(_run, transition=True)
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
@@ -670,12 +787,30 @@ class MemoryManager:
         (``/undo``): same id, truncated transcript."""
         if not new_session_id or not self._owner_allows("on_session_switch"):
             return
+        options = dict(kwargs)
+        if rewound:
+            options["rewound"] = True
+        self._memory_lifecycle.call(
+            lambda: self._notify_session_switch(
+                new_session_id, parent_session_id=parent_session_id, reset=reset, **options
+            ),
+            transition=True, required=False,
+        )
+
+    def _notify_session_switch(
+        self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
+        rewound: bool = False, **kwargs,
+    ) -> None:
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
-        self._each_provider(
-            "on_session_switch failed",
-            lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
-        )
+
+        def _switch(provider: MemoryProvider) -> None:
+            provider.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs)
+            self._record_working_frame_scope(provider)
+
+        completed = self._each_provider("on_session_switch failed", _switch)
+        if len(completed) != len(self._providers):
+            raise RuntimeError("A memory provider did not complete the session transition")
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:
@@ -703,6 +838,20 @@ class MemoryManager:
             if require_checkpoint:  # the caller keeps the uncompressed transcript
                 raise RuntimeError("Memory pre-compress checkpoint refused; see `hermes logs errors`")
             return ""
+        snapshot = list(messages)
+        evidence_snapshot = list(evidence_messages) if evidence_messages is not None else None
+        return self._memory_lifecycle.call(
+            lambda: self._notify_pre_compress(
+                snapshot, evidence_messages=evidence_snapshot, require_checkpoint=require_checkpoint,
+                checkpoint_api_version=checkpoint_api_version,
+            ),
+            transition=False, required=require_checkpoint,
+        ) or ""
+
+    def _notify_pre_compress(
+        self, messages: list[dict[str, Any]], *, evidence_messages: Optional[list[dict[str, Any]]] = None,
+        require_checkpoint: bool = False, checkpoint_api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION,
+    ) -> str:
         parts = []
         checkpoint_succeeded = False
         messages, evidence_messages = _redact_for_provider(messages or [], evidence_messages)
@@ -719,6 +868,7 @@ class MemoryManager:
                 kwargs["require_checkpoint"] = require_checkpoint
             try:
                 result = provider.on_pre_compress(provider_messages, **kwargs)
+                self._record_working_frame_scope(provider)
                 if result and result.strip():
                     parts.append(result)
                 checkpoint_succeeded = checkpoint_succeeded or is_checkpoint_provider
@@ -855,9 +1005,20 @@ class MemoryManager:
             self.flush_pending(timeout=10)
             self.shutdown_all()
 
-    def shutdown_all(self) -> None:
-        """Drain the background executor (bounded), then shut providers down in reverse order."""
-        self._drain_sync_executor()
+    def shutdown_all(self, *, drain: bool = True) -> None:
+        """Drain the worker (bounded), then shut providers down in reverse order.
+
+        ``drain=False`` avoids a second wait after a reset/undo retirement timed out.
+        """
+        if drain:
+            self._drain_sync_executor()
+        else:
+            with self._sync_executor_lock:
+                self._shutting_down = True
+                executor = self._sync_executor
+                self._sync_executor = None
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
                             providers=self._providers[::-1])
 

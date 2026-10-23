@@ -20,6 +20,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.private_execution import private_execution_active
 from agent.served_model import result_model_fields
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
@@ -190,7 +191,7 @@ def _resolve_budget_fallback(
     # terminal outcome so the task does not remain in an ambiguous lifecycle state. The worker's run is
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
-    if _kanban_task:
+    if _kanban_task and not private_execution_active(agent):
         _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
     return final_response, _turn_exit_reason, preserved_verification_fallback, interrupted
 
@@ -461,6 +462,8 @@ def _apply_output_hooks(
     (``apply_llm_output_transform`` from ``finish_text_response`` / ``_persist_step``); this
     call returns that recorded outcome, and only fires the hook here when no earlier seam saw a
     response (e.g. text that only appeared through ``_explain_abnormal_exit``)."""
+    if private_execution_active(agent):
+        return final_response, False, None
     final_response, transformed, pre_transform = apply_llm_output_transform(
         agent, final_response, turn_id=turn_id, platform=platform, logger=logger,
     )
@@ -495,6 +498,8 @@ def apply_llm_output_transform(
     same turn get the recorded outcome instead of a second hook firing. Only the current
     turn's not-yet-written text is touched — earlier turns and the system prompt are never
     rewritten (prompt-cache invariant)."""
+    if private_execution_active(agent):
+        return final_response, False, None
     if logger is None:
         from agent.conversation_loop import logger
     recorded = getattr(agent, "_llm_output_transform", None)
@@ -531,6 +536,7 @@ def finalize_turn(
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
 
+    _private_run = private_execution_active(agent)
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
         interrupted=interrupted, failed=failed, messages=messages,
@@ -601,13 +607,15 @@ def finalize_turn(
     # The model has answered (or the loop gave up): a title upgrade held back because it shares a
     # self-hosted endpoint with the main request (#117296) may go out now.
     from agent.turn_context import start_deferred_title_upgrade
-    _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
+    if not _private_run:
+        _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
-    _guarded_cleanup(
-        "save_trajectory",
-        lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
-        _cleanup_errors, logger,
-    )
+    if not _private_run:
+        _guarded_cleanup(
+            "save_trajectory",
+            lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
+            _cleanup_errors, logger,
+        )
     _guarded_cleanup(
         "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
         _cleanup_errors, logger,
@@ -630,9 +638,10 @@ def finalize_turn(
         if final_response and not interrupted:
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
-        if not interrupted and not failed:
+        if not interrupted and not failed and not _private_run:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
-        agent._persist_session(messages, conversation_history)
+        if not _private_run:
+            agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 
@@ -654,7 +663,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _private_run:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -663,15 +672,16 @@ def finalize_turn(
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        _notify_context_engine_turn_complete(
-            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
-            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
-            interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    if not _private_run:
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            _notify_context_engine_turn_complete(
+                agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
+                turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
+                interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Surrogate chokepoint: RAW SDK text with a lone UTF-16 surrogate crashes downstream
     # consumers (stdout, Telegram ``utf16_len``, JSON); scrub once where it leaves the loop.
@@ -770,10 +780,11 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
-    )
+    if not _private_run:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message, final_response=final_response,
+            interrupted=interrupted, messages=messages,
+        )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
@@ -782,6 +793,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not _private_run
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
@@ -793,7 +805,7 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    if not getattr(agent, "_persist_disabled", False):
+    if not _private_run and not getattr(agent, "_persist_disabled", False):
         _invoke_hook_safely(
             "on_session_end", logger,
             session_id=agent.session_id,

@@ -596,6 +596,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run_turn_runner_clarify_delivery import (
             UNDELIVERED_NO_SURFACE, _clarify_send_then_wait, text_fallback_coro)
         from tools import clarify_gateway as clarify_mod
+        from tools.clarify_evidence import for_source
         import uuid
         ctx = self._ctx
         if not ctx._status_adapter:
@@ -617,6 +618,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         entry = clarify_mod.register(
             clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
             multi_select=bool(multi_select),
+            evidence=for_source(ctx.source, clarify_id, question, choices, multi_select),
         )
         # Unlike approval, clarify passes reopen=True so the continuation re-opens a native stream
         # below the question; if the re-seed fails the consumer degrades to send() automatically.

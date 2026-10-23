@@ -1296,8 +1296,11 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
 
 
 def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+    from agent.private_execution import private_execution_active
+
     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
     agent._memory_store = None
+    agent._memory_manager = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
@@ -1305,7 +1308,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._iters_since_skill = 0
     from agent.safe_worker_policy import safe_worker_enabled
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or private_execution_active(agent):
         agent._memory_manager = None
         return
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
@@ -1340,7 +1343,6 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 agent._memory_store.load_from_disk()
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
-    agent._memory_manager = None
     if memory_manager is not None and not skip_memory:
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead

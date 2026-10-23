@@ -65,7 +65,10 @@ def test_resumed_thread_gets_no_seed_but_a_failed_resume_fallback_does(monkeypat
     """thread/resume already holds the conversation; the fresh thread started after a failed resume does not."""
     client = _FakeClient()
     monkeypatch.setattr(sess_mod, "CodexAppServerClient", lambda **kw: client)
-    db = SimpleNamespace(get_session_model_config_value=lambda *_: "stored-thread", patch_session_model_config=lambda *_: None)
+    db = SimpleNamespace(
+        get_session_model_config_value=lambda _sid, key: "stored-thread" if key == "codex_thread_id" else None,
+        patch_session_model_config=lambda *_: None,
+    )
     agent = _agent(_session_db=db, session_id="s1", _emit_diagnostic_status=lambda *_: None)
     codex_runtime._ensure_codex_session(agent, _HISTORY)
     codex_runtime._start_codex_thread(agent)

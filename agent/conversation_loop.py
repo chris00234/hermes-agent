@@ -34,7 +34,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from agent.turn_context import PreflightCompressionTimedOut, build_turn_context, current_turn_wire_content
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_scripted_prelude import Prelude, play_prelude
@@ -1605,8 +1605,13 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
 def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
+    # Memory prefetch, pre_llm_call and gateway-note context ride the single codex input,
+    # byte-equal to the api_content stamp.
     codex_result = agent._run_codex_app_server_turn(
-        user_message=s.user_message, original_user_message=s.original_user_message,
+        user_message=current_turn_wire_content(
+            s.messages, s.current_turn_user_idx, s.user_message, s._ext_prefetch_cache, s._plugin_user_context,
+        ),
+        original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory,
     )

@@ -18,6 +18,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone, UTC
 from typing import Any, Callable, Optional
 
 from agent.display import (
@@ -33,6 +34,7 @@ from agent.display import (
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.private_execution import private_execution_active
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
 from agent.lsp import deferred as lsp_deferred
@@ -60,6 +62,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
     extract_persisted_path,
+    generate_preview,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 from hermes_cli.observability.shared_metrics_efficiency import note_tool_result, record_tool_batch
@@ -354,6 +357,107 @@ def _append_skipped_tool_results(
             if not flushed and stop_on_flush_failure:
                 return False
     return True
+
+
+def _private_lease_active(lease_expires_at: str) -> bool:
+    """True while the policy's ISO-UTC lease expiry is in the future."""
+    raw = str(lease_expires_at).strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    expires = datetime.fromisoformat(raw)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires > datetime.now(UTC)
+
+
+def _private_execution_block_message(agent, function_name: str) -> str | None:
+    """Fail-closed private-execution gate (DE_DESIGN §5); None allows the call.
+
+    When either the private-policy ContextVar or
+    ``agent._private_execution_policy`` is set: both must be present and
+    digest-equal, the tool's registry toolset must be in
+    ``allowed_toolsets``, and the lease must be unexpired. Any accessor
+    error, absence-when-expected, mismatch, disallowed tool, or expired
+    lease blocks the call.
+    """
+    try:
+        from gateway.private_execution_policy import (
+            ALWAYS_DENIED_TOOLS,
+            current_private_policy,
+        )
+
+        context_policy = current_private_policy()
+        agent_policy = getattr(agent, "_private_execution_policy", None)
+    except Exception:
+        return "Tool blocked: private execution policy state is unreadable"
+    if context_policy is None and agent_policy is None:
+        return None
+    try:
+        if context_policy is None or agent_policy is None:
+            return "Tool blocked: private execution policy context is incomplete"
+        if context_policy.policy_digest != agent_policy.policy_digest:
+            return "Tool blocked: private execution policy mismatch"
+        if function_name in ALWAYS_DENIED_TOOLS:
+            # Denied by TOOL name regardless of registry toolset mapping —
+            # delegate_task lives in the "delegation" toolset and a child
+            # agent or cross-agent message would escape the policy fences.
+            return (
+                f"Tool blocked: {function_name} is never allowed under a "
+                "private execution grant"
+            )
+        from tools.registry import registry
+
+        toolset = registry.get_toolset_for_tool(function_name)
+        if toolset is None or toolset not in context_policy.allowed_toolsets:
+            return (
+                f"Tool blocked: {function_name} is outside the private "
+                "execution grant"
+            )
+        if not _private_lease_active(context_policy.effective_lease_expires_at):
+            return "Tool blocked: private execution lease expired"
+    except Exception:
+        return "Tool blocked: private execution policy check failed"
+    return None
+
+
+def _truncate_private_tool_result(content: str, config: BudgetConfig) -> str:
+    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    suffix = "\n..." if has_more else ""
+    return (
+        f"{preview}{suffix}\n\n"
+        f"[Truncated in memory: tool result was {len(content):,} chars; "
+        "private execution policy forbids spillover persistence.]"
+    )
+
+
+def _persist_or_truncate_tool_result(
+    agent,
+    *,
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    effective_task_id: str,
+    config: BudgetConfig,
+) -> str:
+    """Spillover persistence, or in-memory truncation for policy-bound runs.
+
+    A run carrying the private execution policy must never write raw tool
+    results to ``$HERMES_HOME/cache/spillover`` (DE_DESIGN §1.1 #18); its
+    oversized results are truncated in memory instead. Fail-closed: an
+    unreadable policy state also truncates rather than persisting.
+    """
+    if not private_execution_active(agent):
+        return maybe_persist_tool_result(
+            content=content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            env=get_active_env(effective_task_id),
+            config=config,
+        )
+    threshold = config.resolve_threshold(tool_name)
+    if threshold == float("inf") or len(content) <= threshold:
+        return content
+    return _truncate_private_tool_result(content, config)
 
 
 def _tool_search_scoped_names(agent) -> frozenset:
@@ -714,6 +818,11 @@ def _dispatch_authorized_once(
         resolve = lambda: _pre_tool_block(agent, ref)
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
+    if block_message is None:
+        block_message = _private_execution_block_message(agent, ref.name)
+        if block_message is not None:
+            block_error_type = "private_execution_grant_block"
+
     block_body = None if block_message is None else {"error": block_message}
 
     # Checked once, after plugin modify hooks (which may replace arguments) and
@@ -1129,13 +1238,15 @@ def _commit_tool_result(
     if _is_multimodal_tool_result(persisted_result):
         persisted_result = _persist_multimodal_text_parts(
             persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
+            agent=agent,
         )
     else:
-        persisted_result = maybe_persist_tool_result(
+        persisted_result = _persist_or_truncate_tool_result(
+            agent,
             content=persisted_result,
             tool_name=function_name,
             tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
+            effective_task_id=effective_task_id,
             config=budget,
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
@@ -1185,7 +1296,30 @@ def _commit_tool_result(
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
 
 
-def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: str, env, budget: BudgetConfig) -> dict:
+def _enforce_private_turn_budget(tool_messages: list, budget: BudgetConfig) -> None:
+    """Match largest-first enforcement without the storage layer's ContextVar-only fence.
+
+    A missing ContextVar must not let an agent-bound private result spill at turn end.
+    Multimodal content and existing spillover references retain their upstream shape.
+    """
+    total_size = sum(len(message.get("content", "")) for message in tool_messages)
+    candidates = [
+        message for message in tool_messages
+        if isinstance(message.get("content"), str) and not extract_persisted_path(message["content"])
+    ]
+    for message in sorted(candidates, key=lambda item: len(item["content"]), reverse=True):
+        if total_size <= budget.turn_budget:
+            break
+        content = message["content"]
+        replacement = _truncate_private_tool_result(content, budget)
+        if len(replacement) < len(content):
+            total_size += len(replacement) - len(content)
+            message["content"] = replacement
+
+
+def _persist_multimodal_text_parts(
+    result: dict, tool_name: str, tool_call_id: str, env, budget: BudgetConfig, *, agent=None,
+) -> dict:
     """Spill oversized TEXT parts of a multimodal envelope through the same persistence policy as
     string results (#95429). A ``browser_exec`` call that captured a screenshot bakes its full
     stdout into the envelope's text part, which used to bypass ``maybe_persist_tool_result``
@@ -1196,10 +1330,13 @@ def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: s
     for part in parts:
         text = part.get("text") if isinstance(part, dict) and part.get("type") == "text" else None
         if isinstance(text, str):
-            # One spill file per part: a second oversized part under the same id would overwrite the first's file.
             part_id = tool_call_id if not spilled else f"{tool_call_id}_part{spilled}"
-            replaced = maybe_persist_tool_result(content=text, tool_name=tool_name, tool_use_id=part_id,
-                                                 env=env, config=budget)
+            if private_execution_active(agent):
+                replaced = (_truncate_private_tool_result(text, budget)
+                            if len(text) > budget.resolve_threshold(tool_name) else text)
+            else:
+                replaced = maybe_persist_tool_result(content=text, tool_name=tool_name, tool_use_id=part_id,
+                                                     env=env, config=budget)
             if replaced != text:
                 part = {**part, "text": replaced}
                 first_replacement = first_replacement or replaced
@@ -1223,8 +1360,12 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
         return
     batch = messages[-num_tools:]
     contents_before = [message.get("content") for message in batch]
-    enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
-    plugin_live_notes.keep_after_turn_budget(agent, batch)
+    if private_execution_active(agent):
+        _enforce_private_turn_budget(batch, budget)
+    else:
+        enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
+    if not private_execution_active(agent):
+        plugin_live_notes.keep_after_turn_budget(agent, batch)
     record_tool_batch(agent, batch, contents_before)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 

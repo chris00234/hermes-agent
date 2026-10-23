@@ -33,6 +33,7 @@ from agent.turn_context import (
     build_turn_context,
     compose_multimodal_context_part,
     compose_user_api_content,
+    current_turn_wire_content,
 )
 from hermes_state import SessionDB
 
@@ -277,17 +278,25 @@ class TestPrologueStamping:
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
 
-    def test_no_stamp_for_codex_app_server(self):
-        """codex_app_server turns bypass the api_messages build, so the
-        injected bytes are never sent — stamping would persist a lie."""
+    def test_codex_app_server_turn_stamps_the_bytes_codex_receives(self):
+        """codex_app_server takes the turn as ONE input: the injected context rides it, so the
+        stamp is persisted like every other lane and is exactly what the codex input carries."""
         agent = _FakeAgent()
         agent.api_mode = "codex_app_server"
+        literal = "그리고 내 브렌드 로고 갖고 있지?"
         with patch(
             "hermes_cli.plugins.invoke_hook",
             return_value=[{"context": "PLUGIN-CTX"}],
         ):
-            ctx = _build(agent)
-        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+            ctx = _build(agent, user_message=literal)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == literal
+        assert msg["api_content"] == literal + "\n\nPLUGIN-CTX"
+        assert agent.api_content_at_persist == literal + "\n\nPLUGIN-CTX"
+        assert current_turn_wire_content(
+            ctx.messages, ctx.current_turn_user_idx, ctx.user_message,
+            ctx.ext_prefetch_cache, ctx.plugin_user_context,
+        ) == msg["api_content"]
 
     def test_appends_context_part_for_multimodal_turn(self):
         """#71998: pre_llm_call context must reach an image-only (multimodal)

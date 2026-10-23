@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shlex
+import sys
 import sqlite3
 import tempfile
 import threading
@@ -394,6 +395,36 @@ def extract_persisted_path(content: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _private_policy_bound() -> bool:
+    """True when the private-execution-policy ContextVar is bound.
+
+    Single choke point for spillover persistence (DE_DESIGN §1.1 #18): every
+    caller of :func:`maybe_persist_tool_result` — including
+    ``enforce_turn_budget``'s ``threshold=0`` path — is covered. Mirrors the
+    hermes_logging record-factory pattern: if the policy module was never
+    imported no policy can be bound (public); once it is loaded, any error
+    reading the accessor counts as bound (fail-closed).
+    """
+    pep = sys.modules.get("gateway.private_execution_policy")
+    if pep is None:
+        return False
+    try:
+        return pep.current_private_policy() is not None
+    except Exception:
+        return True
+
+
+def _truncate_in_memory(content: str, config: BudgetConfig) -> str:
+    """In-memory replacement for spillover under a private execution policy."""
+    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    suffix = "\n..." if has_more else ""
+    return (
+        f"{preview}{suffix}\n\n"
+        f"[Truncated in memory: tool result was {len(content):,} chars; "
+        "private execution policy forbids spillover persistence.]"
+    )
+
+
 def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, env=None,
                               config: BudgetConfig = DEFAULT_BUDGET,
                               threshold: float | None = None) -> str:
@@ -404,6 +435,12 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
         threshold = config.resolve_threshold(tool_name)
     if threshold == float("inf") or len(content) <= threshold:
         return content
+    if _private_policy_bound():
+        logger.info(
+            "Inline-truncating large tool result: %s (%d chars, private execution policy)",
+            tool_name, len(content),
+        )
+        return _truncate_in_memory(content, config)
     # The size decision above stays on the raw inline result (that is what cost context); the file
     # and the preview carry the pageable text inside an MCP envelope (#90426).
     persisted_content = _pageable_text(content)

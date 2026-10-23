@@ -29,9 +29,10 @@ def _plugin_hooks(hook_name: str, **kwargs: Any) -> list[Any]:
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
+    from hermes_cli.plugins import _private_execution_context_bound
     from agent.safe_worker_policy import safe_worker_enabled
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or _private_execution_context_bound():
         return []
     _observe(hook_name, **kwargs)
     return _plugin_hooks(hook_name, **kwargs)
@@ -48,9 +49,10 @@ async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
 
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
+    from hermes_cli.plugins import _private_execution_context_bound
     from agent.safe_worker_policy import safe_worker_enabled
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or _private_execution_context_bound():
         return False
     try:
         from hermes_cli.observability import handles_hook
@@ -80,6 +82,10 @@ def session_end_messages(results: Any) -> list[str]:
 
 def finalize_session(**kwargs: Any) -> list[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
+    from hermes_cli.plugins import _private_execution_context_bound
+
+    if _private_execution_context_bound():
+        return []
     _observe("on_session_finalize", **kwargs)
 
     session_id = str(kwargs.get("session_id") or "")

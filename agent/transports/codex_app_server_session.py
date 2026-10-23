@@ -53,6 +53,9 @@ class TurnResult:
     # Exact turn/start text distinguishes the input echo from a new user event.
     submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_total: Optional[dict[str, Any]] = None
+    token_usage_snapshot: Optional[dict[str, Any]] = field(default=None, repr=False)
+    api_call_count: int = 0
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Codex likely wedged (turn timeout, dead subprocess, token refresh failure): caller respawns next turn.
@@ -218,6 +221,7 @@ class CodexAppServerSession:
         model: Optional[str] = None, model_provider: Optional[str] = None,
         developer_instructions: Optional[str] = None, resume_thread_id: Optional[str] = None,
         history_seed: Optional[str] = None,
+        on_thread_started: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -250,6 +254,7 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._on_thread_started = on_thread_started
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -298,6 +303,8 @@ class CodexAppServerSession:
             self._service_tier_sent = None  # a new thread runs codex's own configured tier
             logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
         self._thread_id = thread_id
+        if self._on_thread_started is not None:
+            self._on_thread_started(thread_id)
         return thread_id
 
     def _resume_thread(self, wanted: str, params: dict[str, Any]) -> str:
@@ -452,13 +459,16 @@ class CodexAppServerSession:
 
     def run_turn(
         self, user_input: Any, *, model: Optional[str] = None, reasoning_effort: Optional[str] = None,
-        service_tier: Optional[str] = None, turn_timeout: float = 600.0,
+        reasoning_summary: Optional[str] = None, service_tier: Optional[str] = None,
+        turn_timeout: Optional[float] = 600.0,
         notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
 
-        model / reasoning_effort: sent on ``turn/start`` (codex applies them to this and later turns), so an
-        in-place ``/model`` or effort change reaches a thread that was started with other settings.
+        model / reasoning_effort / reasoning_summary: sent on ``turn/start`` (codex applies them to this and later
+        turns), so an in-place ``/model`` or effort change reaches a thread that was started with other settings.
+        Without a ``summary`` codex's reasoning items carry no text (live codex-cli 0.162.1), so nothing is
+        persisted or shown.
         service_tier: sent only when it differs from what this thread last received, so codex's own configured
         tier is left alone until Hermes selects one, and ``None`` after a selection clears it.
 
@@ -469,6 +479,10 @@ class CodexAppServerSession:
         (#112928). Only subprocess death or ``turn_timeout`` retires the session.
         """
         result = TurnResult()
+        if turn_timeout is not None and turn_timeout <= 0:
+            result.interrupted = True
+            result.error = "Codex run budget exhausted before turn/start"
+            return result
         if self._start_for(result):
             # Do not clear first: a hard stop arriving during ensure_started() must
             # be honored before launching a Codex turn.
@@ -481,6 +495,8 @@ class CodexAppServerSession:
                     params["model"] = model
                 if reasoning_effort is not None:
                     params["effort"] = reasoning_effort
+                if reasoning_summary is not None:
+                    params["summary"] = reasoning_summary
                 if service_tier != self._service_tier_sent:
                     params["serviceTier"] = service_tier
                 ts = self._request_for(result, "turn/start", params, "turn/start")
@@ -491,7 +507,7 @@ class CodexAppServerSession:
         return result
 
     def _run_started_turn(
-        self, result: TurnResult, ts: dict, turn_timeout: float, notification_poll_timeout: float,
+        self, result: TurnResult, ts: dict, turn_timeout: Optional[float], notification_poll_timeout: float,
         post_tool_quiet_timeout: float,
     ) -> None:
         """Drive an accepted ``turn/start`` to completion: quiet warning, approvals, projection."""
@@ -510,7 +526,7 @@ class CodexAppServerSession:
                 return False
             last_tool_completion_at = None
             logger.warning(
-                "codex has emitted no events for %.0fs after a tool result; still waiting (turn deadline %.0fs)",
+                "codex has emitted no events for %.0fs after a tool result; still waiting (turn deadline %s)",
                 post_tool_quiet_timeout, turn_timeout,
             )
             return False
@@ -561,7 +577,7 @@ class CodexAppServerSession:
             self._active_turn_id = None
 
     def _drive_turn(
-        self, result: TurnResult, *, turn_timeout: float, notification_poll_timeout: float,
+        self, result: TurnResult, *, turn_timeout: Optional[float], notification_poll_timeout: float,
         timeout_label: str, on_server_request: Callable[[dict], bool],
         on_note: Callable[[dict, str], bool], before_poll: Optional[Callable[[], bool]] = None,
         pre_scope_filter: Optional[Callable[[dict, str], bool]] = None,
@@ -575,7 +591,7 @@ class CodexAppServerSession:
         return True to complete the turn. Deadline without completion interrupts and
         retires the session.
         """
-        deadline = time.monotonic() + turn_timeout
+        deadline = time.monotonic() + turn_timeout if turn_timeout is not None else float("inf")
         turn_complete = False
         client = self._client
         while time.monotonic() < deadline and not turn_complete:
@@ -811,9 +827,9 @@ def _apply_accounting_notification(result: TurnResult, note: dict) -> None:
     if method == "thread/tokenUsage/updated":
         token_usage = params.get("tokenUsage") or {}
         if isinstance(token_usage, dict):
-            last, window = token_usage.get("last"), token_usage.get("modelContextWindow")
-            if isinstance(last, dict):
-                result.token_usage_last = dict(last)
+            from agent.codex_usage import record_usage
+            record_usage(result, token_usage)
+            window = token_usage.get("modelContextWindow")
             if isinstance(window, int) and window > 0:
                 result.model_context_window = window
         return

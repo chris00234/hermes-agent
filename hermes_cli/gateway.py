@@ -34,6 +34,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
 from gateway.status import terminate_pid
+from hermes_cli.gateway_service_process import gateway_pid_for_service
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
@@ -207,6 +208,8 @@ def _get_service_pids(all_profiles: bool = False) -> set:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
+    workers = (gateway_pid_for_service(pid) for pid in tuple(pids))
+    pids.update(pid for pid in workers if pid is not None)
     return pids
 
 
@@ -257,6 +260,9 @@ def _request_gateway_self_restart(pid: int) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
     if not hasattr(signal, "SIGUSR1") or not _is_pid_ancestor_of_current_process(pid):
         return False
+    pid = gateway_pid_for_service(pid)
+    if pid is None:
+        return False
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
     except (ProcessLookupError, PermissionError, OSError):
@@ -273,6 +279,11 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float, *, on_progress
     a long wait can report what the gateway is still holding for (``update_cmd_drain_report``).
     """
     if not hasattr(signal, "SIGUSR1") or pid <= 0:
+        return False
+    # A pre-update timestamp wrapper may not forward USR1. Drain its gateway
+    # directly so the wrapper cannot exit first and orphan the old worker.
+    pid = gateway_pid_for_service(pid)
+    if pid is None:
         return False
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 
 
+import pytest
+
 from hermes_cli.codex_runtime_plugin_migration import (
     MIGRATION_MARKER,
     MIGRATION_END_MARKER,
@@ -152,7 +154,122 @@ class TestStripExistingManagedBlock:
 
 class TestMigrate:
 
+    @pytest.mark.parametrize("permission_text", [
+        'sandbox_mode = "danger-full-access"\napproval_policy = "never"\n',
+        'sandbox_mode = "read-only"\napproval_policy = "untrusted"\n',
+        'approval_policy = { reject = { sandbox_approval = true } }\n',
+        '"default_permissions" = ":read-only"\n',
+        'default_permissions = ":danger-no-sandbox"\n',
+        'default_permissions = "custom"\n[permissions.custom]\nnetwork = false\n',
+        'sandbox_mode = "workspace-write"\n[sandbox_workspace_write]\nnetwork_access = false\n',
+    ])
+    @pytest.mark.parametrize("managed", [False, True])
+    def test_native_permissions_survive_repeated_migration(
+        self, tmp_path, permission_text, managed
+    ):
+        import tomllib
 
+        expected = tomllib.loads(permission_text)
+        existing = (f"{MIGRATION_MARKER}\n{permission_text}{MIGRATION_END_MARKER}\n"
+                    if managed else permission_text)
+        target = tmp_path / "config.toml"
+        target.write_text(existing + '[features]\nexample = true\n', encoding="utf-8")
+        previous = None
+        for fallback in (":workspace", ":read-only", None):
+            report = migrate({}, codex_home=tmp_path, discover_plugins=False,
+                             default_permission_profile=fallback)
+            assert report.written and not report.errors
+            text = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(text)
+            assert {key: parsed[key] for key in expected} == expected
+            assert parsed.get("default_permissions") == expected.get("default_permissions")
+            assert parsed["features"] == {"example": True}
+            assert "hermes-tools" in parsed["mcp_servers"]
+            assert report.wrote_permissions_default is None
+            if previous is not None:
+                assert text == previous
+            previous = text
+
+    @pytest.mark.parametrize(("options", "expected"), [
+        ({}, ":workspace"),
+        ({"default_permission_profile": ":read-only"}, ":read-only"),
+        ({"default_permission_profile": None}, None),
+    ])
+    @pytest.mark.parametrize("existing", [None, ""])
+    def test_permission_fallback_only_initializes_unconfigured_home(
+        self, tmp_path, options, expected, existing
+    ):
+        import tomllib
+
+        target = tmp_path / "config.toml"
+        if existing is not None:
+            target.write_text(existing, encoding="utf-8")
+        for iteration in range(3):
+            report = migrate({}, codex_home=tmp_path, discover_plugins=False, **options)
+            assert report.written and not report.errors
+            parsed = tomllib.loads(target.read_text(encoding="utf-8"))
+            assert parsed.get("default_permissions") == expected
+            assert "sandbox_mode" not in parsed and "approval_policy" not in parsed
+            assert report.wrote_permissions_default == (expected if iteration == 0 else None)
+
+    @pytest.mark.parametrize(("name", "key", "explicit_table"), [
+        ("brain", "brain", True),
+        ("brain", '"br\\u0061in"', True),
+        ("brain.remote", "'brain.remote'", False),
+        ("hermes-tools", "'hermes-tools'", True),
+    ])
+    def test_repeated_migrate_preserves_colliding_user_mcp(
+        self, tmp_path, name, key, explicit_table
+    ):
+        import tomllib
+
+        user_text = (
+            (f"[mcp_servers.{key}]\ncommand = 'user-server'\n" if explicit_table else "")
+            + f"[mcp_servers.{key}.env]\n"
+            + 'BRAIN_ACTOR = "codex_studio" # user identity\n'
+            + f"[mcp_servers.{key}.tools.brain_store]\n"
+            + 'approval_policy = "prompt"\nenabled = true\n'
+        )
+        expected = tomllib.loads(user_text)["mcp_servers"][name]
+        target = tmp_path / "config.toml"
+        target.write_text(user_text, encoding="utf-8")
+        config = {"mcp_servers": {
+            name: {"command": "generated-server", "env": {"BRAIN_ACTOR": "hermes"}},
+            "other": {"command": "other-server"},
+        }}
+        for _ in range(2):
+            report = migrate(config, codex_home=tmp_path, discover_plugins=False)
+            assert report.written and not report.errors
+            text = target.read_text(encoding="utf-8")
+            servers = tomllib.loads(text)["mcp_servers"]
+            assert servers[name] == expected
+            assert set(servers) == {name, "other", "hermes-tools"}
+            assert servers["other"]["command"] == "other-server"
+            assert text.count(user_text) == 1
+            assert name not in report.migrated
+
+    @pytest.mark.parametrize(("existing", "config", "error_fragment"), [
+        ('[mcp_servers.brain\ncommand = "user-server"\n', {}, "not valid TOML"),
+        ('', {"mcp_servers": {"bad\x01": {"command": "x"}}}, "not valid TOML"),
+    ])
+    def test_invalid_toml_fails_before_write(
+        self, tmp_path, monkeypatch, existing, config, error_fragment
+    ):
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+
+        target = tmp_path / "config.toml"
+        target.write_text(existing, encoding="utf-8")
+        before = target.read_bytes()
+        monkeypatch.setattr(crpm, "_query_codex_plugins", lambda **kwargs: ([], None))
+
+        def unexpected_write(*args):
+            pytest.fail("invalid TOML must not reach the writer")
+
+        monkeypatch.setattr(crpm, "_write_atomic", unexpected_write)
+        report = migrate(config, codex_home=tmp_path)
+        assert not report.written
+        assert any(error_fragment in error for error in report.errors)
+        assert target.read_bytes() == before
 
     def test_plugin_discovery_writes_plugin_blocks(self, tmp_path, monkeypatch):
         """Discovered curated plugins land as [plugins."<name>@<marketplace>"]

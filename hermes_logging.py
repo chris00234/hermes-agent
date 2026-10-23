@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from logging.handlers import QueueHandler, QueueListener
@@ -282,6 +283,23 @@ def _install_session_record_factory() -> None:
             record.hermes_home = str(get_hermes_home().resolve())  # type: ignore[attr-defined]
         except Exception:
             record.hermes_home = ""  # type: ignore[attr-defined]
+        # Private-lane marker (DE_DESIGN §1.1 #19): stamped at record
+        # creation so it survives the QueueListener thread hop. The
+        # ContextVar lives in gateway.private_execution_policy — if that
+        # module was never imported no policy can be bound, so the record
+        # is public. Once the module exists, any error reading the policy
+        # marks the record private (dropped) — fail-closed, inverting the
+        # fail-open hermes_home precedent above.
+        _pep = sys.modules.get("gateway.private_execution_policy")
+        if _pep is None:
+            record.hermes_private = False  # type: ignore[attr-defined]
+        else:
+            try:
+                record.hermes_private = (  # type: ignore[attr-defined]
+                    _pep.current_private_policy() is not None
+                )
+            except Exception:
+                record.hermes_private = True  # type: ignore[attr-defined]
         return record
     _session_record_factory._hermes_session_injector = True  # type: ignore[attr-defined]
     logging.setLogRecordFactory(_session_record_factory)
@@ -289,6 +307,75 @@ def _install_session_record_factory() -> None:
 
 # Install on import so session_tag exists on all records even before setup_logging().
 _install_session_record_factory()
+
+
+# ---------------------------------------------------------------------------
+# Filters
+# ---------------------------------------------------------------------------
+
+def _record_is_private(record: logging.LogRecord) -> bool:
+    """True when *record* was created inside a private-execution context."""
+    return bool(getattr(record, "hermes_private", False))
+
+
+# Args a ``hermes_private_allow`` record may interpolate: identifiers only
+# (run ids, error classes) - anything prose-shaped keeps the record dropped.
+_PRIVATE_ALLOW_ARG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+# Fixed templates the ``hermes_private_allow`` marker may pass. Deny by
+# default: a message pre-interpolated with private prose (f-string or
+# %-formatting before the logging call) is a plain str at runtime and
+# indistinguishable from a literal template, so only registered templates
+# are honored — anything else keeps the record dropped.
+_PRIVATE_ALLOW_TEMPLATES = frozenset({
+    # gateway/platforms/api_server_runs.py — sanitized private-run failures
+    "Provider authentication failed for run=%s: provider_auth_failed",
+    "[api_server] private run %s failed: run_failed",
+})
+
+
+def _private_allow_honored(record: logging.LogRecord) -> bool:
+    """True when an opted-in private record provably carries no prose.
+
+    Honors ``hermes_private_allow`` ONLY for a registered fixed template
+    (``_PRIVATE_ALLOW_TEMPLATES``) with identifier-shaped string args and
+    no exception/stack payload, so the marker cannot become a hole for
+    interpolated private prose.
+    """
+    if not getattr(record, "hermes_private_allow", False):
+        return False
+    if record.exc_info or record.exc_text or record.stack_info:
+        return False
+    if not isinstance(record.msg, str):
+        return False
+    if record.msg not in _PRIVATE_ALLOW_TEMPLATES:
+        return False
+    args = record.args or ()
+    if isinstance(args, dict):
+        return False
+    return all(
+        isinstance(arg, str) and _PRIVATE_ALLOW_ARG_RE.fullmatch(arg)
+        for arg in args
+    )
+
+
+class _PrivateRecordFilter(logging.Filter):
+    """Drop records stamped ``hermes_private`` (DE_DESIGN §1.1 #19).
+
+    Fail-closed: any error evaluating the markers drops the record rather
+    than letting private prose reach a shared log file. The only pass-through
+    is ``hermes_private_allow`` on fixed-template records
+    (``_private_allow_honored``) so sanitized fixed-error-class lines stay
+    visible to operators.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if not _record_is_private(record):
+                return True
+            return _private_allow_honored(record)
+        except Exception:
+            return False
 
 
 class _ComponentFilter(logging.Filter):
@@ -441,6 +528,10 @@ def setup_verbose_logging() -> None:
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(RedactingFormatter(_LOG_FORMAT_VERBOSE, datefmt="%H:%M:%S"))
     handler._hermes_verbose = True  # type: ignore[attr-defined]
+    # launchd captures stderr into gateway.error.log — private-lane records
+    # must be dropped here like on every other handler this module installs
+    # (DE_DESIGN §1.1 #19).
+    handler.addFilter(_PrivateRecordFilter())
     root.addHandler(handler)
 
     if root.level > logging.DEBUG:
@@ -734,6 +825,15 @@ class _ProfileRoutingFileHandler(logging.Handler):
         return rv
 
     def emit(self, record: logging.LogRecord) -> None:
+        # Private-lane drop (DE_DESIGN §1.1 #19), fail-closed: an error
+        # evaluating the markers drops the record instead of routing it.
+        # Same decision as _PrivateRecordFilter — the allow lane keeps the
+        # sanitized fixed-template failure lines visible to operators.
+        try:
+            if _record_is_private(record) and not _private_allow_honored(record):
+                return
+        except Exception:
+            return
         try:
             home = self._home_for_record(record)
             handler = self._handler_for_home(home)
@@ -1005,6 +1105,7 @@ def _add_rotating_handler(
     )
     if log_filter is not None:
         handler.addFilter(log_filter)
+    handler.addFilter(_PrivateRecordFilter())
     # Routing already on (a second home adopted earlier): a component log added now —
     # ``mode="gateway"`` after the fact — must route too, or it takes every home's records.
     routers = [h for h in _queued_file_handlers if isinstance(h, _ProfileRoutingFileHandler)]

@@ -12,6 +12,7 @@ import dataclasses
 import logging
 import os
 import shlex
+import time
 from typing import Optional, Union
 
 from agent.i18n import t
@@ -31,6 +32,7 @@ logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.
 # Bound on the off-loop agent cleanup during /new; past it the reset proceeds and the teardown
 # finishes (or leaks) in its worker thread rather than blocking the event loop.
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+_WORKING_FRAME_RETIRE_TIMEOUT_S = 10.0
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
@@ -176,6 +178,45 @@ class GatewaySessionCommandsMixin:
         await self.hooks.emit("session:end", dict(hook_payload))
         await self.hooks.emit("session:reset", dict(hook_payload))
 
+    async def _retire_working_frame_scope(self, session_key: str, *, rewound: bool):
+        """Return a cleared ACK, None for legacy/orphan scopes, or False to block mutation."""
+        getter = getattr(self.session_store, "get_working_frame_scope", None)
+        if not callable(getter):
+            return None
+        from gateway.working_frame_scope import (
+            OrphanedWorkingFrameScopeError, retire_working_frame_scope_sync,
+        )
+
+        scope = None
+        try:
+            scope = await self.async_session_store.get_working_frame_scope(session_key)
+            if scope is None:
+                return None
+            if not isinstance(scope, dict):
+                return False
+            # The worker shares this deadline so queued work cannot clear a frame after timeout.
+            deadline = time.monotonic() + _WORKING_FRAME_RETIRE_TIMEOUT_S
+            return await asyncio.wait_for(
+                self._run_in_executor_with_context(
+                    retire_working_frame_scope_sync, self, session_key, scope, rewound, deadline,
+                ), timeout=_WORKING_FRAME_RETIRE_TIMEOUT_S,
+            )
+        except OrphanedWorkingFrameScopeError:
+            if not isinstance(scope, dict):
+                return False
+            logger.warning("Dropping unretirable working frame scope for %s", session_key)
+            try:
+                expired = await self.async_session_store.expire_working_frame_scope(
+                    session_key, scope["session_id"],
+                )
+                return None if expired else False
+            except Exception as exc:
+                logger.warning("Working frame scope expiry failed: %s", type(exc).__name__)
+                return False
+        except Exception as exc:
+            logger.warning("Working frame scope retirement failed for %s: %s", session_key, type(exc).__name__)
+            return False
+
     async def _handle_discard_command(self, event: MessageEvent) -> str:
         """``/discard``: drop this chat's turn lost in a gateway restart so its queue runs again."""
         from gateway.session_authorities import active_authority
@@ -198,6 +239,8 @@ class GatewaySessionCommandsMixin:
         source = event.source
         session_key = self._session_key_for_source(source)
         await self._hm_stop_owner_turn(session_key)  # idle and confirmed resets too (N53)
+        if await self._retire_working_frame_scope(session_key, rewound=False) is False:
+            return t("gateway.reset.memory_scope_failed")
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped: the in-flight run's own
         # guarded release (old generation) returns False and would leave a zombie slot that silently
@@ -631,15 +674,32 @@ class GatewaySessionCommandsMixin:
             except ValueError:
                 return t("gateway.undo.invalid_count", arg=raw_args.split()[0])
         session_entry = await self.async_session_store.get_or_create_session(source)
+        session_key = self._session_key_for_source(source)
+        frame_ack = None
+        getter = getattr(self.session_store, "get_working_frame_scope", None)
+        try:
+            scope = await self.async_session_store.get_working_frame_scope(session_key) if callable(getter) else None
+            if scope is not None:
+                if not isinstance(scope, dict):
+                    return t("gateway.undo.memory_scope_failed")
+                if not await self.async_session_store.has_rewindable_user_turn(session_entry.session_id):
+                    return t("gateway.undo.nothing")
+                frame_ack = await self._retire_working_frame_scope(session_key, rewound=True)
+                if frame_ack is False:
+                    return t("gateway.undo.memory_scope_failed")
+        except Exception as exc:
+            logger.warning("Working frame undo probe failed: %s", type(exc).__name__)
+            return t("gateway.undo.memory_scope_failed")
         result = await self.async_session_store.rewind_session(session_entry.session_id, n)
         if result is None:
+            if isinstance(frame_ack, dict):
+                logger.warning("undo: working frame retired but rewind removed no turn for %s", session_key)
+                return t("gateway.undo.frame_reset_without_rewind")
             return t("gateway.undo.nothing")
         session_entry.last_prompt_tokens = 0  # transcript was truncated
         self._record_model_friction("undo", source, session_entry.session_id, result.get("turns_undone") or 1)
         try:
-            # The cache is keyed by the profile-namespaced key; a bare build_session_key(source)
-            # yields ``agent:main:…`` and misses for every secondary profile.
-            self._evict_cached_agent(self._session_key_for_source(source))
+            self._evict_cached_agent(session_key)
         except Exception as e:
             logger.debug("undo: cached-agent eviction skipped: %s", e)
         target_text = result["target_text"]

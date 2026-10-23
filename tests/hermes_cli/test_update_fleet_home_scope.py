@@ -78,16 +78,16 @@ def test_systemd_unit_of_another_home_is_left_alone(monkeypatch, own_home):
 def test_manual_gateway_of_another_home_is_not_stopped(monkeypatch, own_home):
     """Of two ``gateway run`` processes on the host, only the one on the updating home is SIGTERMed;
     a process whose home cannot be read is spared as well."""
-    _pid_homes(monkeypatch, {111: str(own_home), 222: FOREIGN_HOME, 333: None})
+    _pid_homes(monkeypatch, {111: str(own_home), 222: FOREIGN_HOME, 333: None, 444: str(own_home)})
     monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda **k: set())
-    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **k: [111, 222, 333])
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **k: [111, 222, 333, 444])
     monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda **k: [])
     monkeypatch.setattr("hermes_cli.gateway._wait_for_gateway_exit", lambda **k: None)
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
     out = fleet._GatewayRestartOutcome(
-        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=[],
+        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[111, 222, 333], restarted_services=[],
         failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
     )
     fleet._restart_manual_gateways(out, 5.0)

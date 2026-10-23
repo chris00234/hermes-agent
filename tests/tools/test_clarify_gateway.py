@@ -448,3 +448,86 @@ class TestNativeRejectClassification:
         )
         assert value is None
         assert reason == "prose"
+
+
+class TestEvidenceForSource:
+    """for_source must validate the exact strings the surfaces deliver."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @staticmethod
+    def _source():
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        return SessionSource(
+            platform=Platform.TELEGRAM, chat_id="123", user_id="777",
+        )
+
+    @staticmethod
+    def _patch_hooks(monkeypatch, sink=None):
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda name, **kwargs: (sink.append(kwargs["payload"]) if sink is not None else None) or [],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "liz",
+        )
+
+    def test_evidence_options_are_the_delivered_decorated_strings(self, monkeypatch):
+        self._patch_hooks(monkeypatch)
+        from tools.clarify_evidence import for_source
+        from tools.clarify_tool import mark_recommended
+
+        choices = ["Rebase", "Merge"]
+        evidence = for_source(self._source(), "cid", "Q", choices, False)
+        assert list(evidence.options) == mark_recommended(choices)
+        assert evidence.options[0].endswith("(Recommended)")
+
+    def test_delivery_of_decorated_strings_matches_evidence(self, monkeypatch):
+        events = []
+        self._patch_hooks(monkeypatch, sink=events)
+        from tools.clarify_evidence import for_source
+        from tools.clarify_tool import mark_recommended
+
+        choices = ["Rebase", "Merge"]
+        evidence = for_source(self._source(), "cid", "Q", choices, False)
+        evidence.delivered(
+            question="Q",
+            options=mark_recommended(choices),
+            rendered_text="rendered",
+            bot_id="900",
+            chat_id="123",
+            thread_id=None,
+            message_id="100",
+        )
+        assert evidence.delivery is not None
+        assert events[0]["options"] == mark_recommended(choices)
+
+    def test_decorated_first_choice_over_wire_cap_yields_no_evidence(self, monkeypatch):
+        self._patch_hooks(monkeypatch)
+        from tools.clarify_evidence import for_source
+
+        # 500 bare chars pass the naive cap, but the delivered first choice
+        # carries " (Recommended)" (514 chars) and would break the 512-char
+        # wire contract: no evidence rather than mismatched evidence.
+        assert for_source(self._source(), "cid", "Q", ["A" * 500, "B"], False) is None
+
+    def test_decorated_first_choice_at_wire_cap_is_allowed(self, monkeypatch):
+        self._patch_hooks(monkeypatch)
+        from tools.clarify_evidence import for_source
+
+        evidence = for_source(self._source(), "cid", "Q", ["A" * 498, "B"], False)
+        assert evidence is not None
+        assert len(evidence.options[0]) == 512
+
+    def test_already_decorated_choices_are_not_double_decorated(self, monkeypatch):
+        self._patch_hooks(monkeypatch)
+        from tools.clarify_evidence import for_source
+        from tools.clarify_tool import mark_recommended
+
+        decorated = mark_recommended(["Rebase", "Merge"])
+        evidence = for_source(self._source(), "cid", "Q", decorated, False)
+        assert list(evidence.options) == decorated

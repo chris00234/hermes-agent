@@ -153,6 +153,24 @@ def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
     return v if isinstance(v, str) else None
 
 
+def current_turn_wire_content(
+    messages: list[Any], current_turn_user_idx: Any, user_message: Any,
+    ext_prefetch_cache: str, plugin_user_context: str,
+) -> Any:
+    """What a runtime that takes the turn as ONE input sends for the current user message: the
+    prologue's api_content stamp (sidecar and wire cannot drift), a multimodal row's parts (its
+    context part is already appended), else the live composition."""
+    in_range = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
+    msg = messages[current_turn_user_idx] if in_range else None
+    if isinstance(msg, dict) and msg.get("role") == "user":
+        if sidecar := extract_api_content_sidecar(msg):
+            return sidecar
+        if isinstance(msg.get("content"), list):
+            return msg["content"]
+    composed = compose_user_api_content(user_message, ext_prefetch_cache, plugin_user_context)
+    return user_message if composed is None else composed
+
+
 def _pop_turn_note(agent: Any, attr: str) -> str:
     """One-shot per-turn note: read and clear, so the system prompt stays byte-stable and a
     cached agent never replays a stale note."""
@@ -1199,14 +1217,14 @@ def build_turn_context(
     # no-op once titled; it ensures the session row itself.
     _maybe_title_session_at_turn_start(agent, messages, title_user_message)
 
-    # Sidecar skipped for codex_app_server/MoA; list content carries its context as a part in every mode.
+    # Sidecar skipped for MoA; list content carries its context as a part in every mode.
     if 0 <= current_turn_user_idx < len(messages) and messages[current_turn_user_idx].get("role") == "user":
         if isinstance(messages[current_turn_user_idx].get("content"), list):
             _append_multimodal_context(
                 agent, messages[current_turn_user_idx], ext_prefetch_cache, plugin_user_context,
                 preflight_compressed=compaction.compressed,
             )
-        elif not moa_active and getattr(agent, "api_mode", None) != "codex_app_server":
+        elif not moa_active:
             _stamp_api_content_sidecar(
                 agent, messages, current_turn_user_idx, ext_prefetch_cache,
                 plugin_user_context, preflight_compressed=compaction.compressed,

@@ -346,25 +346,22 @@ class TestGeneratedSystemdUnits:
         assert "LD_LIBRARY_PATH" not in gateway_cli.generate_systemd_unit(system=False)
 
 
-    def test_launchd_plist_persists_configured_nofile_soft_limit(self, monkeypatch):
-        """The generated plist must carry SoftResourceLimits/NumberOfFiles so a
-        plist rewrite by `hermes gateway start` cannot strip the FD floor and
-        reintroduce EMFILE crashes (launchd default soft limit is 256)."""
+    def test_launchd_plist_persists_configured_nofile_limit(self, monkeypatch):
+        """launchd must receive the configured target as both RLIMIT values."""
         from hermes_cli import resource_limits
 
         monkeypatch.setattr(
             resource_limits, "configured_nofile_soft_limit", lambda config=None: 65536
         )
 
-        plist = gateway_cli.generate_launchd_plist()
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
 
-        assert "<key>SoftResourceLimits</key>" in plist
-        assert "<key>NumberOfFiles</key>" in plist
-        assert "<integer>65536</integer>" in plist
+        assert plist["SoftResourceLimits"]["NumberOfFiles"] == 65536
+        assert plist["HardResourceLimits"]["NumberOfFiles"] == 65536
 
     def test_launchd_plist_omits_nofile_block_when_disabled(self, monkeypatch):
         """runtime.nofile_soft_limit: 0/false/null disables the adjustment; the
-        plist must then not contain a SoftResourceLimits block at all."""
+        plist must then not contain either resource-limit block."""
         from hermes_cli import resource_limits
 
         monkeypatch.setattr(
@@ -374,6 +371,7 @@ class TestGeneratedSystemdUnits:
         plist = gateway_cli.generate_launchd_plist()
 
         assert "SoftResourceLimits" not in plist
+        assert "HardResourceLimits" not in plist
 
 
 class TestWslInteropPaths:

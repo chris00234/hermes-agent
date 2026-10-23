@@ -70,13 +70,13 @@ def _make_codex_agent(**kwargs):
 
 class TestRunConversationCodexPath:
     @pytest.mark.parametrize(
-        "reasoning_config,service_tier,expected_effort,expected_tier",
+        "reasoning_config,service_tier,expected_effort,expected_tier,expected_summary",
         [
-            ({"enabled": True, "effort": "high"}, "priority", "high", "fast"),
-            ({"enabled": False}, None, "none", None),
+            ({"enabled": True, "effort": "high"}, "priority", "high", "fast", "auto"),
+            ({"enabled": False}, None, "none", None, "none"),
             # Hermes-only levels are clamped to the route's vocabulary: gpt-5.4 has no `max`, so ultra goes out as xhigh.
             # A tier codex has no word for is not sent.
-            ({"enabled": True, "effort": "ultra"}, "ultrafast", "xhigh", None),
+            ({"enabled": True, "effort": "ultra"}, "ultrafast", "xhigh", None, "auto"),
         ],
     )
     def test_effective_runtime_settings_reach_codex_turn(
@@ -86,6 +86,7 @@ class TestRunConversationCodexPath:
         service_tier,
         expected_effort,
         expected_tier,
+        expected_summary,
     ):
         captured = {}
 
@@ -113,6 +114,7 @@ class TestRunConversationCodexPath:
 
         assert captured["model"] == "gpt-5.4"
         assert captured["reasoning_effort"] == expected_effort
+        assert captured["reasoning_summary"] == expected_summary
         assert captured["service_tier"] == expected_tier
 
     @pytest.mark.parametrize("model,expected", [("gpt-5.6-sol", "ultra"), ("gpt-5.5", "xhigh")])
@@ -146,6 +148,29 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    @pytest.mark.parametrize("current_reasoning", ["checked the config first", None])
+    def test_result_carries_only_the_current_turns_reasoning(self, monkeypatch, current_reasoning):
+        """The gateway, CLI and TUI show ``last_reasoning``; codex attaches it to the tool-call step, and a
+        prior turn's reasoning must never leak into this turn's display."""
+        def fake_run_turn(self, user_input, **kwargs):
+            tool_step = {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "exec_1", "type": "function", "function": {"name": "exec_command", "arguments": "{}"}}]}
+            if current_reasoning:
+                tool_step["reasoning"] = current_reasoning
+            return TurnResult(final_text="done", projected_messages=[
+                tool_step, {"role": "tool", "tool_call_id": "exec_1", "content": "ok"},
+                {"role": "assistant", "content": "done"},
+            ], turn_id="tu1", thread_id="th1")
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "th1")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        history = [{"role": "user", "content": "earlier"},
+                   {"role": "assistant", "content": "ok", "reasoning": "prior turn reasoning"}]
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello", conversation_history=history)
+        assert result["last_reasoning"] == current_reasoning
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
@@ -160,6 +185,9 @@ class TestRunConversationCodexPath:
                     "outputTokens": 25,
                     "reasoningOutputTokens": 5,
                 },
+                token_usage_total={"inputTokens": 180, "cachedInputTokens": 60,
+                                   "outputTokens": 55, "reasoningOutputTokens": 15, "totalTokens": 260},
+                api_call_count=2,
                 model_context_window=200000,
             )
 
@@ -171,28 +199,26 @@ class TestRunConversationCodexPath:
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
 
-        # inputTokens (80) is INCLUSIVE of cachedInputTokens (20): uncached=60, prompt=60+20=80 (never 100),
-        # totalTokens stays the provider passthrough (130). #105412 / #63654
-        assert result["api_calls"] == 1
-        assert result["prompt_tokens"] == 80
-        assert result["completion_tokens"] == 25
-        assert result["total_tokens"] == 130
-        assert result["input_tokens"] == 60
-        assert result["output_tokens"] == 25
-        assert result["cache_read_tokens"] == 20
+        assert result["api_calls"] == 2
+        assert result["prompt_tokens"] == 180
+        assert result["completion_tokens"] == 55
+        assert result["total_tokens"] == 260
+        assert result["input_tokens"] == 120
+        assert result["output_tokens"] == 55
+        assert result["cache_read_tokens"] == 60
         assert result["cache_write_tokens"] == 0
-        assert result["reasoning_tokens"] == 5
+        assert result["reasoning_tokens"] == 15
         assert result["last_prompt_tokens"] == 80
 
-        assert agent.session_api_calls == 1
-        assert agent.session_prompt_tokens == 80
-        assert agent.session_completion_tokens == 25
-        assert agent.session_total_tokens == 130
-        assert agent.session_input_tokens == 60
-        assert agent.session_output_tokens == 25
-        assert agent.session_cache_read_tokens == 20
+        assert agent.session_api_calls == 2
+        assert agent.session_prompt_tokens == 180
+        assert agent.session_completion_tokens == 55
+        assert agent.session_total_tokens == 260
+        assert agent.session_input_tokens == 120
+        assert agent.session_output_tokens == 55
+        assert agent.session_cache_read_tokens == 60
         assert agent.session_cache_write_tokens == 0
-        assert agent.session_reasoning_tokens == 5
+        assert agent.session_reasoning_tokens == 15
         assert agent.context_compressor.last_prompt_tokens == 80
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130

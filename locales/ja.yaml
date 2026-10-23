@@ -329,6 +329,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — タイトルなしでセッションを開始しました。"
     title_empty_untitled: "\n⚠️ クリーンアップ後にタイトルが空になりました — タイトルなしでセッションを開始しました。"
     tip: "\n✦ ヒント: {tip}"
+    memory_scope_failed: "メモリチェックポイントを終了できませんでした。セッションは変更されていません。しばらくしてからもう一度お試しください。"
   restart:
     in_progress: "⏳ ゲートウェイの再起動はすでに進行中です..."
     restarting: "♻ ゲートウェイを再起動しています。60 秒以内に通知が届かない場合は、コンソールで `hermes gateway restart` を実行してください。"
@@ -508,6 +509,8 @@ gateway:
     nothing: "元に戻せる操作がありません。"
     removed: "↩️ {turns} ターンを取り消しました（{count} 件のメッセージ）。\nバックアップ先: 「{preview}」\n上のテキストをコピー／編集して送信すると、ここから再入力できます。"
     invalid_count: "無効な数値「{arg}」— /undo または /undo N を使用してください。"
+    memory_scope_failed: "メモリチェックポイントを終了できませんでした。セッションは変更されていません。しばらくしてからもう一度お試しください。"
+    frame_reset_without_rewind: "メモリチェックポイントはリセットされましたが、会話ターンは削除できませんでした — トランスクリプトは変更されていません。"
   update:
     platform_not_messaging: "✗ /update はメッセージングプラットフォームでのみ利用可能です。ターミナルで `hermes update` を実行してください。"
     not_git_repo: "✗ Git リポジトリではありません — 更新できません。"

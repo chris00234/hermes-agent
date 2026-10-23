@@ -651,6 +651,28 @@ class SessionTranscriptMixin:
                 "empty: %s", session_id, e, exc_info=True)
             raise TranscriptReadError(session_id) from e
 
+    def has_rewindable_user_turn(self, session_id: str) -> bool:
+        """Probe the durable rewind classifier without retiring a no-op undo's frame."""
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return False
+        from agent.context_compressor import (
+            split_user_originated_turn,
+            user_originated_turn_view,
+        )
+
+        try:
+            durable = db.get_messages_as_conversation(session_id, include_row_ids=True)
+            return any(
+                user_originated_turn_view(message) is not None
+                and isinstance(message.get("_row_id"), int)
+                and split_user_originated_turn(message)[1] is not None
+                for message in durable
+            )
+        except Exception as exc:
+            logger.debug("has_rewindable_user_turn: %s", type(exc).__name__)
+            return False
+
     def rewind_session(
         self, session_id: str, n: int = 1, *, require_retryable_composite: bool = False,
     ) -> Optional[dict[str, Any]]:

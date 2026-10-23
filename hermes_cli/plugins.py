@@ -1239,7 +1239,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         changes / new bundled backends become visible in long-lived sessions."""
         from agent.safe_worker_policy import safe_worker_enabled
 
-        if safe_worker_enabled() or plugin_discovery_suppressed():
+        if safe_worker_enabled() or _private_execution_context_bound() or plugin_discovery_suppressed():
             # Safe workers never discover; a config-only read of a profile this process must not
             # load plugins for is suppressed too.
             return
@@ -1721,7 +1721,7 @@ def discover_plugins(force: bool = False) -> None:
     background discovery instead of racing a second scan."""
     from agent.safe_worker_policy import safe_worker_enabled
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or _private_execution_context_bound():
         return
     _join_background_discovery()
     get_plugin_manager().discover_and_load(force=force)
@@ -1740,6 +1740,8 @@ def start_background_plugin_discovery() -> None:
     if safe_worker_enabled():
         return
     global _background_discovery_thread
+    if _private_execution_context_bound():
+        return
     manager = get_plugin_manager()
     if manager._discovered:
         return
@@ -1814,6 +1816,24 @@ def get_portable_mcp_server_names_nowait() -> set[str]:
     return _nowait_plugin_set("portable_mcp", lambda m: set(m.get_portable_mcp_servers()))
 
 
+def _private_execution_context_bound() -> bool:
+    """True when the calling context carries a ``PrivateExecutionPolicy``.
+
+    Reads the ContextVar through ``sys.modules`` instead of importing the
+    gateway package: the ContextVar object lives in
+    ``gateway.private_execution_policy``, so if that module was never
+    imported no policy can be bound in this process and hooks proceed.
+    Once the module exists, any error reading it fails closed (private).
+    """
+    module = sys.modules.get("gateway.private_execution_policy")
+    if module is None:
+        return False
+    try:
+        return module.current_private_policy() is not None
+    except Exception:
+        return True
+
+
 def _delivery_manager() -> PluginManager:
     """Active manager, lazily discovering if it never ran — delivery must not depend on WHICH
     surface imported us (dashboards/TUI/cron never import model_tools). ``getattr`` default
@@ -1841,7 +1861,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
     ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
     callbacks registered by user plugins (tracking #64178).
+
+    Private execution is suppressed before lazy discovery can import plugin code.
     """
+    if _private_execution_context_bound():
+        return []
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
@@ -1884,11 +1908,15 @@ def has_hook(hook_name: str) -> bool:
 
     Lazy-discovers first — same gate-before-invoke rationale as :func:`has_middleware` (tracking #64178).
     """
+    if _private_execution_context_bound():
+        return False
     return _delivery_manager().has_hook(hook_name)
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
     """Return a stable snapshot of callbacks registered for a hook."""
+    if _private_execution_context_bound():
+        return ()
     return get_plugin_manager().iter_hook_callbacks(hook_name)
 
 

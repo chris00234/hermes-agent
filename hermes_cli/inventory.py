@@ -141,6 +141,12 @@ def build_models_payload(
 
     if include_unconfigured:
         rows = list(rows) + _without_slug(_append_unconfigured_rows(rows, ctx), "moa")
+    if ctx.excluded_providers:
+        from hermes_cli.models import normalize_provider
+
+        # Setup/current recovery and virtual rows must not resurrect hidden providers.
+        excluded = {normalize_provider(str(p)) for p in ctx.excluded_providers if p}
+        rows = [r for r in rows if normalize_provider(_slug(r)) not in excluded]
     if picker_hints:
         _apply_picker_hints(rows)
     if canonical_order:

@@ -824,6 +824,9 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
@@ -1325,6 +1328,9 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_responses(self, request: web.Request) -> web.Response:
         """POST /v1/responses — OpenAI Responses API format."""
+        grant_err = self._reject_stray_private_grant(request)
+        if grant_err is not None:
+            return grant_err
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _coerce_request_bool,
             _error_response, _invalid_request, _redact_api_error_text,

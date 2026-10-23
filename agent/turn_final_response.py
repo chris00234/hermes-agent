@@ -12,6 +12,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
+from agent.private_execution import private_execution_active
 from agent.reasoning_promotion import answer_in_reasoning_capability
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.turn_failure_copy import stamp_failure
@@ -361,7 +362,8 @@ def finish_text_response(
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
     # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.
     try:
-        agent._flush_messages_to_session_db(messages, conversation_history)
+        if not private_execution_active(agent):
+            agent._flush_messages_to_session_db(messages, conversation_history)
     except Exception:
         logger.warning(
             "final text-turn flush failed (session=%s) — reply is "

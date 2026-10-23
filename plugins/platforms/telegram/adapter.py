@@ -3863,6 +3863,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self.name, chat_id)
             return SendResult(success=True, message_id=message_id, raw_response={"skipped": True})
         self._hold_chat_outbound_slot(chat_id)
+        from gateway.telegram_clarify_evidence import invalidate
+
+        invalidate(self, chat_id, message_id)
+
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
         # Rich finalize (Bot API 10.1): when the completed content has constructs the legacy MarkdownV2 edit
@@ -4297,7 +4301,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
                 rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
-            return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
+            def on_sent(msg):
+                from gateway.telegram_clarify_evidence import delivered
+
+                self._clarify_state[clarify_id] = session_key
+                delivered(self, clarify_id, msg, question, choices, text, keyboard)
+
+            return text, keyboard, on_sent
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
 
@@ -4715,6 +4725,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._accept_update()
         data = query.data
         cb = self._callback_ctx(query)
+        # Keep the native Update (including update_id), never reconstruct one from a query.
+        cb["update"] = update
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
@@ -4861,9 +4873,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 await self._notify_clarify_expired(query, user_display)
                 return
             await query.answer(text=_toast("platform.telegram.prompt.type_answer"))
+            from gateway.telegram_clarify_evidence import invalidate
+
+            invalidate(self, cb["chat_id"], query.message.message_id)
             await self._edit_html_quiet(
                 query,
-                f"❓ {query.message.text or ''}\n\n"
+                f"❓ {_html.escape(query.message.text or '')}\n\n"
                 f"<i>{_html.escape(t('platform.telegram.prompt.awaiting_typed', user=user_display))}</i>")
             return
         # Numeric choice → resolve immediately with the chosen text
@@ -4873,20 +4888,31 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
             return
         resolved_text: Optional[str] = None
+        entry_alive = False
         try:
             from tools.clarify_gateway import get_pending
             entry = get_pending(clarify_id)
-            if entry and entry.choices and 0 <= idx < len(entry.choices):
-                resolved_text = entry.choices[idx]
+            if entry and entry.choices:
+                entry_alive = True
+                if 0 <= idx < len(entry.choices):
+                    resolved_text = entry.choices[idx]
         except Exception:
             resolved_text = None
         if resolved_text is None:
+            if entry_alive:
+                # A crafted out-of-range index must leave the live prompt open.
+                await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
+                return
             # Race (timeout / session reset): echo the index so the agent sees an intentional response.
             resolved_text = f"choice {idx + 1}"
+        from gateway.telegram_clarify_callbacks import capture
+
+        selected_callback = await capture(self, cb.get("update"), clarify_id)
         self._clarify_state.pop(clarify_id, None)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
-            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+            resolved = resolve_gateway_clarify(
+                clarify_id, resolved_text, selected_callback=selected_callback)
         except Exception as exc:
             logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
             resolved = False
@@ -6486,6 +6512,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         media cached, attribution applied."""
         from plugins.platforms.telegram.telegram_context import group_trigger_text
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        if msg_type == MessageType.TEXT:
+            from gateway.telegram_clarify_evidence import candidate
+
+            raw_candidate = candidate(self, update, msg)
+            handler = getattr(self, "_platform_event_handler", None)
+            if raw_candidate is not None and handler is not None:
+                try:
+                    event._clarify_original_reply = await handler(
+                        raw_candidate, self._source_from_message_for_auth(msg))
+                except Exception:
+                    logger.debug("Clarify evidence dispatch failed", exc_info=True)
         event.text = group_trigger_text(self, msg, event.text)
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)

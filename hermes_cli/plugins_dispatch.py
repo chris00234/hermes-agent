@@ -262,9 +262,10 @@ class PluginDispatchMixin:
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
+        from hermes_cli.plugins import _private_execution_context_bound
         from agent.safe_worker_policy import safe_worker_enabled
 
-        if safe_worker_enabled():
+        if safe_worker_enabled() or _private_execution_context_bound():
             return []
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
@@ -528,9 +529,10 @@ class PluginDispatchMixin:
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
+        from hermes_cli.plugins import _private_execution_context_bound
         from agent.safe_worker_policy import safe_worker_enabled
 
-        if safe_worker_enabled():
+        if safe_worker_enabled() or _private_execution_context_bound():
             return False
         return bool(self._hooks.get(hook_name))
 
@@ -574,9 +576,10 @@ class PluginDispatchMixin:
 
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
+        from hermes_cli.plugins import _private_execution_context_bound
         from agent.safe_worker_policy import safe_worker_enabled
 
-        if safe_worker_enabled():
+        if safe_worker_enabled() or _private_execution_context_bound():
             return ()
         return tuple(self._hooks.get(hook_name, ()))
 

@@ -116,6 +116,60 @@ def test_cli_picker_hides_excluded_provider_by_alias(config_home):
     )
 
 
+@pytest.mark.parametrize("explicit_only,include_unconfigured", [(False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("current_provider", ["anthropic", "moa"])
+def test_inventory_exclusions_survive_setup_and_virtual_rows(
+    config_home, tmp_path, monkeypatch, explicit_only, include_unconfigured, current_provider,
+):
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    other_home = tmp_path / "other"
+    other_home.mkdir()
+    config = {
+        "model": {"provider": current_provider, "default": "saved-model"},
+        # MoA is opt-in: an enabled preset keeps its virtual row visible unless excluded.
+        "moa": {"presets": {"default": {"enabled": True}}},
+    }
+    _write_config(config_home, **config, model_catalog={"excluded_providers": [" CLAUDE ", " MoA "]})
+    _write_config(other_home, **config)
+    # No credentials: the current row comes from recovery and all others from setup.
+    monkeypatch.setattr("hermes_cli.model_switch.list_authenticated_providers", lambda **kw: [])
+    for home, excluded in [(config_home, True), (other_home, False), (config_home, True)]:
+        token = set_hermes_home_override(home)
+        try:
+            payload = build_models_payload(
+                load_picker_context(), explicit_only=explicit_only,
+                include_unconfigured=include_unconfigured,
+            )
+        finally:
+            reset_hermes_home_override(token)
+        slugs = {row["slug"] for row in payload["providers"]}
+        if excluded:
+            assert not slugs & {"anthropic", "moa"}
+        else:
+            assert current_provider in slugs
+            if include_unconfigured:
+                assert "anthropic" in slugs
+                if not explicit_only:
+                    assert "moa" in slugs
+        assert payload["provider"] == current_provider
+        assert payload["model"] == "saved-model"
+
+
+@pytest.mark.parametrize("current_provider", ["anthropic", "moa"])
+def test_gateway_picker_cannot_reintroduce_excluded_moa(config_home, monkeypatch, current_provider):
+    from hermes_cli.model_switch_providers import list_picker_providers
+
+    _write_config(config_home, moa={"presets": {"default": {"enabled": True}}})
+    monkeypatch.setattr("hermes_cli.model_switch.list_authenticated_providers", lambda **kw: [])
+    for excluded in ([], [" MoA "], []):
+        rows = list_picker_providers(
+            current_provider=current_provider, include_moa=True, excluded_providers=excluded,
+        )
+        assert ("moa" in {row["slug"] for row in rows}) is (not bool(excluded))
+
+
 def test_cli_picker_empty_excluded_is_noop(config_home):
     """An empty ``excluded_providers`` list must not change the menu."""
     _write_config(config_home, model_catalog={"excluded_providers": []})

@@ -46,8 +46,14 @@ def _probe_launchd_domain_for_label(label: str) -> str:
         except launchctl_errors:
             pass
 
-    # Not loaded anywhere: Aqua → gui/<uid>; anything else (Background, loginwindow) → user/<uid>,
-    # the pre-probing default and the recommended domain on macOS 26+.
+    # Not loaded anywhere: a live GUI login session wins even from SSH, because only gui/<uid> can
+    # read the login keychain (native CLI OAuth) and TCC grants; otherwise Aqua → gui/<uid>, and
+    # anything else (Background, loginwindow) → user/<uid>, the recommended domain on macOS 26+.
+    try:
+        subprocess.run(["launchctl", "print", gui_domain], check=True, timeout=5, capture_output=True)
+        return gui_domain
+    except launchctl_errors:
+        pass
     try:
         result = subprocess.run(["launchctl", "managername"], timeout=5, **_gw()._CAPTURE_TEXT, check=False)
         if "Aqua" in (result.stdout or ""):
@@ -390,6 +396,12 @@ def generate_launchd_plist() -> str:
     if nofile_target:
         nofile_block = f"""
     <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>{nofile_target}</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
         <integer>{nofile_target}</integer>

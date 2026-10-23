@@ -84,6 +84,8 @@ def _make_runner(session_db=None):
     )
 
     runner.session_store = MagicMock()
+
+    runner.session_store.get_working_frame_scope.return_value = None
     runner.session_store._generate_session_key.side_effect = lambda source: build_session_key(
         source,
         group_sessions_per_user=getattr(runner.config, "group_sessions_per_user", True),

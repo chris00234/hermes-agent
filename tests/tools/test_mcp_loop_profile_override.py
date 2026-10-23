@@ -8,6 +8,7 @@ get_hermes_home() inside the coroutine, most visibly OAuth token-store
 paths. _run_on_mcp_loop now wraps scheduled coroutines with the caller's
 override (mcp_tool_loop._wrap_with_home_override).
 """
+import asyncio
 import os
 
 import pytest
@@ -108,3 +109,33 @@ def test_wrap_is_noop_without_override(mcp_loop):
     wrapped = mcp_loop._wrap_with_home_override(coro)
     assert wrapped is coro
     coro.close()
+
+
+def test_stdio_subprocess_inherits_session_profile(tmp_path, monkeypatch, mcp_loop):
+    import subprocess
+    import sys
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.mcp_tool_config import _build_safe_env
+
+    process_home = tmp_path / "process"
+    session_home = tmp_path / "profiles" / "jenna"
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+
+    async def child_environment():
+        env = _build_safe_env(None)
+        assert "OPENAI_API_KEY" not in env
+        output = await asyncio.to_thread(subprocess.check_output,
+            [sys.executable, "-c", "import os; print(os.environ['HERMES_HOME'])"],
+            env=env, text=True,
+        )
+        return output.strip()
+
+    token = set_hermes_home_override(str(session_home))
+    try:
+        assert mcp_loop._run_on_mcp_loop(child_environment(), timeout=10) == str(session_home)
+        assert _build_safe_env({"HERMES_HOME": str(process_home)})["HERMES_HOME"] == str(process_home)
+    finally:
+        reset_hermes_home_override(token)
+    assert mcp_loop._run_on_mcp_loop(child_environment(), timeout=10) == str(process_home)

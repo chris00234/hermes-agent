@@ -1388,7 +1388,7 @@ def list_picker_providers(
         current_model=current_model, for_picker=True, excluded_providers=excluded_providers,
         non_blocking_catalogs=non_blocking_catalogs, probe_custom_providers=probe_custom_providers,
         probe_current_custom_provider=probe_current_custom_provider)
-    if include_moa:
+    if include_moa and "moa" not in {str(p).strip().lower() for p in (excluded_providers or []) if p}:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
     filtered: list[dict] = []

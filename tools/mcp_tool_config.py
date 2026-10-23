@@ -212,6 +212,8 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
         value = get_secret(key)
         if value is not None:
             env[key] = value
+    from hermes_constants import get_hermes_home
+    env["HERMES_HOME"] = str(get_hermes_home())
     for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
         if key in os.environ:
             env[key] = os.environ[key]

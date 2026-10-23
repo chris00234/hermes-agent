@@ -147,17 +147,21 @@ def _queue_token_counts(agent, fail_msg: str, *fail_extra: Any, counts: Callable
 
 
 def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]:
-    """Translate Codex app-server token usage into Hermes accounting. Prompt bucket = uncached + cached
-    input (the protocol exposes no cache-write tokens); a turn with no usage still counts as one API call.
+    """Record all native requests while keeping the last request's context size for compression.
+    An accepted turn with no usage still counts as one API call.
     ``messages`` (the transcript mirror) lets real usage anchor the next preflight: this runtime bypasses
     the main loop's capture, and the mirror is never compacted natively, so without an anchor the rough
     estimate grows monotonically and hermes-mode fires thread compaction on tiny threads (#100381)."""
-    agent.session_api_calls += 1
-    usage = getattr(turn, "token_usage_last", None)
+    from agent.codex_usage import canonical_usage as normalize_usage, usage_dict as summarize_usage
+    call_count = getattr(turn, "api_call_count", 0) or int(bool(getattr(turn, "turn_id", None)))
+    agent.session_api_calls += call_count
+    last_usage = getattr(turn, "token_usage_last", None)
+    usage = getattr(turn, "token_usage_total", None) or last_usage
     compressor = getattr(agent, "context_compressor", None)
 
     def billing(**extra):
-        return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
+        return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url,
+                    api_call_count=call_count, **extra)
     if not isinstance(usage, dict) or not usage:
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
@@ -167,26 +171,20 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         _queue_token_counts(agent, "Codex app-server api-call persistence failed (session=%s): %s",
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-    # ``inputTokens`` is INCLUSIVE of ``cachedInputTokens`` (same contract as the Responses API, see
-    # normalize_usage's codex_responses branch); CanonicalUsage.prompt_tokens re-adds cache_read on top of
-    # input_tokens, so the canonical input bucket must be the UNCACHED remainder or cached tokens count twice.
-    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
-    canonical_usage = CanonicalUsage(
-        input_tokens=max(0, _coerce_usage_int(usage.get("inputTokens")) - cache_read_tokens),
-        output_tokens=_coerce_usage_int(usage.get("outputTokens")),
-        cache_read_tokens=cache_read_tokens, cache_write_tokens=0,
-        reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")), raw_usage=usage,
-    )
-    prompt_tokens = canonical_usage.prompt_tokens
+    from agent.usage_pricing import estimate_usage_cost
+    canonical_usage = normalize_usage(usage)
+    context_usage = normalize_usage(last_usage or usage)
+    prompt_tokens = context_usage.prompt_tokens
     total_tokens = _coerce_usage_int(usage.get("totalTokens")) or canonical_usage.total_tokens
     token_counts = {f: getattr(canonical_usage, f) for f in
                     ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
-    usage_dict = {"prompt_tokens": prompt_tokens, "completion_tokens": canonical_usage.output_tokens,
-                  "total_tokens": total_tokens, **token_counts}
+    usage_dict = {**summarize_usage(canonical_usage), "total_tokens": total_tokens}
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
+            compressor.update_from_response({
+                **summarize_usage(context_usage),
+                "total_tokens": _coerce_usage_int((last_usage or usage).get("totalTokens")) or context_usage.total_tokens,
+            })
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
                 compressor.context_length = context_window
@@ -195,7 +193,7 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     if isinstance(messages, list):
         from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
 
-        anchor = capture_usage_anchor(prompt_tokens, canonical_usage.output_tokens, messages)
+        anchor = capture_usage_anchor(prompt_tokens, context_usage.output_tokens, messages)
         if anchor is not None:
             set_usage_anchor(agent, anchor)
     for key, value in usage_dict.items():
@@ -499,29 +497,13 @@ def _codex_developer_instructions(agent) -> str:
     return developer_instructions
 
 
-# Durable codex thread binding: ``sessions.model_config.codex_thread_id`` (hermes_state), written after the
-# turn's projected rows were committed, read by the next AIAgent built for the same Hermes session so an
-# API-server restart (or the per-request agents of /api/sessions/{id}/chat) resumes the model-side thread
-# instead of starting an empty one while Hermes' own transcript continues (#100531).
-_CODEX_THREAD_ID_KEY = "codex_thread_id"
 _CODEX_THREAD_RESUME_NOTICE = "Codex thread could not be resumed; starting a new one."
 
 
-def _stored_codex_thread_id(agent) -> str | None:
-    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-    if db is None or not session_id:
-        return None
-    thread_id = db.get_session_model_config_value(session_id, _CODEX_THREAD_ID_KEY)
-    return thread_id if isinstance(thread_id, str) and thread_id else None
-
-
 def _store_codex_thread_id(agent, thread_id: str | None) -> None:
-    """Merge (``None`` clears) the binding into the session row; a failed write only logs — the turn is done."""
-    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-    if db is None or not session_id:
-        return
-    _call_guarded(db.patch_session_model_config, "codex thread id could not be stored on the session row",
-                  args=(session_id, {_CODEX_THREAD_ID_KEY: thread_id}))
+    from agent.codex_session_state import save_thread_id
+    _call_guarded(save_thread_id, "codex thread id could not be stored on the session row",
+                  args=(agent, thread_id))
 
 
 def _start_codex_thread(agent) -> str:
@@ -614,7 +596,8 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
                                 and getattr(agent, "_codex_session_model_provider", None) == model_provider):
             return
         _close_codex_session(agent)
-    resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else _stored_codex_thread_id(agent)
+    from agent.codex_session_state import load_thread_id
+    resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else load_thread_id(agent)
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
     from hermes_cli.codex_runtime_switch import get_configured_codex_binary
@@ -653,6 +636,7 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     # The model always rides along: codex's home is shared, while the Hermes model is per profile/session,
     # so omitting it ran codex's own default instead of the selection.
     agent._codex_session = CodexAppServerSession(
+        on_thread_started=lambda thread_id: _store_codex_thread_id(agent, thread_id),
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
         codex_bin=get_configured_codex_binary(load_config()),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
@@ -722,10 +706,39 @@ def _finish_codex_turn(agent, turn, messages: list[dict[str, Any]], *, original_
     return usage_result
 
 
+def _codex_turn_options(agent) -> dict[str, Any]:
+    from hermes_cli.config import load_config_readonly
+
+    reasoning = getattr(agent, "reasoning_config", None)
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if effort is None:
+        effort = load_config_readonly().get("agent", {}).get("reasoning_effort")
+    budget = getattr(agent, "run_budget_seconds", None)
+    timeout = None
+    if isinstance(budget, (int, float)) and budget > 0:
+        started = getattr(agent, "_run_budget_started_at", None)
+        elapsed = max(0, time.time() - started) if isinstance(started, (int, float)) and started > 0 else 0
+        timeout = max(0, budget - elapsed)
+    # Gateway inactivity and /stop already interrupt the native session. Only an explicit
+    # wall-clock budget should impose a second deadline on a progressing tool loop.
+    model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
+    if isinstance(reasoning, dict):
+        effort = _codex_turn_effort(agent, model)
+    # Summary follows the Responses rule (``auto`` unless reasoning is off) but keys off the disable itself:
+    # a model without a ``none`` level gets effort None. Off sends ``none``, as turn/start settings are sticky.
+    reasoning_off = effort == "none" or (isinstance(reasoning, dict) and reasoning.get("enabled") is False)
+    return {"model": model, "reasoning_effort": effort, "reasoning_summary": "none" if reasoning_off else "auto",
+            "turn_timeout": timeout}
+
+
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: list[dict[str, Any]],
                               effective_task_id: str, should_review_memory: bool = False) -> dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
-    Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    Returns the chat_completions result shape. ``user_message`` is the turn's wire input (the prologue's
+    api_content stamp when context was injected); the user row is ALREADY in ``messages`` — never append it again."""
+    from agent.private_execution import private_execution_active
+    if private_execution_active(agent):
+        raise RuntimeError("Private execution does not support codex_app_server")
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
@@ -735,11 +748,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     try:
         _start_codex_thread(agent)
-        wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
         turn = agent._codex_session.run_turn(
-            user_input=user_message,
-            model=wire_model, reasoning_effort=_codex_turn_effort(agent, wire_model),
-            service_tier=_codex_turn_service_tier(agent))
+            user_input=user_message, service_tier=_codex_turn_service_tier(agent),
+            **_codex_turn_options(agent))
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
@@ -761,7 +772,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
     return _turn_result(
-        interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
+        interrupt, messages,
+        api_calls=getattr(turn, "api_call_count", 0) or int(bool(getattr(turn, "turn_id", None))),
+        completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,
@@ -771,9 +784,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
 def _turn_result(interrupt: tuple[bool, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
                  error: Any, final_response: Any, **extra: Any) -> dict[str, Any]:
     """Result shape shared with the chat_completions path (``partial`` == ``not completed``)."""
+    from agent.turn_finalizer import _last_turn_reasoning
     user_interrupted, interrupt_message = interrupt
     return {
-        "final_response": final_response, "messages": messages, "api_calls": api_calls,
+        "final_response": final_response, "last_reasoning": _last_turn_reasoning(messages), "messages": messages,
+        "api_calls": api_calls,
         "completed": completed, "partial": not completed, "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
         "error": error, **extra,

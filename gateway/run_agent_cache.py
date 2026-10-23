@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from contextlib import nullcontext, suppress
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -425,6 +426,9 @@ class GatewayAgentCacheMixin:
         """Clear per-session control state that must not survive a boundary switch."""
         if not session_key:
             return
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        clear_clarify(session_key, reason="reset")
         pending_skills_reload_notes = getattr(self, "_pending_skills_reload_notes", None)
         if isinstance(pending_skills_reload_notes, dict):
             pending_skills_reload_notes.pop(session_key, None)
@@ -469,6 +473,9 @@ class GatewayAgentCacheMixin:
 
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        clear_clarify(session_key)
         self._restore_pending_one_turn_model_override(session_key)
         generation = self._begin_session_run_generation(session_key)
         if reason:
@@ -862,6 +869,11 @@ class GatewayAgentCacheMixin:
             if release_after_turn and state is not None:
                 state.turn.retired_agents.append(agent)
             return
+        from tools.clarify_gateway import clear_session as clear_clarify
+
+        # The caller may hold another profile's scope (e.g. /login's free-tier sweep): close pending
+        # clarify evidence under the OWNING profile so its plugins receive prompt_closed.
+        self._run_release_in_profile_scope(partial(clear_clarify, reason="evicted"), (session_key,), session_key)
         if commit_memory:
             target, args = self._commit_then_release_soft, (agent, session_key, True)
         else:

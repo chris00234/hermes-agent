@@ -329,6 +329,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — oturum başlıksız başlatıldı."
     title_empty_untitled: "\n⚠️ Temizlik sonrası başlık boş — oturum başlıksız başlatıldı."
     tip: "\n✦ İpucu: {tip}"
+    memory_scope_failed: "Bellek denetim noktası kapatılamadı; oturum değiştirilmedi. Birazdan tekrar deneyin."
   restart:
     in_progress: "⏳ Gateway yeniden başlatma zaten sürüyor..."
     restarting: "♻ Gateway yeniden başlatılıyor. 60 saniye içinde bildirim almazsanız konsoldan `hermes gateway restart` ile yeniden başlatın."
@@ -508,6 +509,8 @@ gateway:
     nothing: "Geri alınacak bir şey yok."
     removed: "↩️ {turns} tur geri alındı ({count} mesaj).\nYedeklendiği yer: \"{preview}\"\nYukarıdaki metni kopyalayıp/düzenleyip göndererek buradan yeniden sorabilirsiniz."
     invalid_count: "Geçersiz sayı \"{arg}\" — /undo veya /undo N kullanın."
+    memory_scope_failed: "Bellek denetim noktası kapatılamadı; oturum değiştirilmedi. Birazdan tekrar deneyin."
+    frame_reset_without_rewind: "Bellek denetim noktası sıfırlandı ancak hiçbir konuşma turu kaldırılamadı — döküm değişmedi."
   update:
     platform_not_messaging: "✗ /update yalnızca mesajlaşma platformlarında kullanılabilir. Terminalden `hermes update` komutunu çalıştırın."
     not_git_repo: "✗ Git deposu değil — güncellenemiyor."

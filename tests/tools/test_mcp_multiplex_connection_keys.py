@@ -117,8 +117,8 @@ def test_same_named_server_with_other_credentials_is_a_separate_connection(two_p
     assert scope_b not in core._server_tool_scopes[(scope_a, "boom")]
 
     # A routed profile reconciles with NO ambient secret scope (``discover_mcp_tools`` binds the
-    # owner scope only around the config load, #113746): with a source-tagged secret the adopter's
-    # stdio identity still resolves in ITS OWN scope, so an equal value shares the owner's child.
+    # owner scope only around the config load, #113746). Stdio children carry their profile's
+    # HERMES_HOME (e11f1b8c68), so even an equal secret never shares another profile's child.
     import sys
     from agent import secret_scope
     from hermes_cli import env_loader
@@ -135,9 +135,8 @@ def test_same_named_server_with_other_credentials_is_a_separate_connection(two_p
     srv_s._registered_tool_names = reg._register_server_tools("s", srv_s, cfg_s)
     two_profiles("b")
     assert secret_scope.current_secret_scope() is None
-    assert reg.register_connected_into_current_scope({"s": dict(cfg_s)}) == 1
-    assert registry.get_tool_names_for_toolset("mcp-s") == ["mcp__s__t"]
-    assert "s" not in disc._select_new_servers({"s": dict(cfg_s)})
+    assert reg.register_connected_into_current_scope({"s": dict(cfg_s)}) == 0
+    assert "s" in disc._select_new_servers({"s": dict(cfg_s)})
 
 
 def test_oauth_server_is_not_adopted_across_profiles(two_profiles):

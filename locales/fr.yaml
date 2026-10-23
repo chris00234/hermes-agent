@@ -365,6 +365,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — session démarrée sans titre."
     title_empty_untitled: "\n⚠️ Le titre est vide après nettoyage — session démarrée sans titre."
     tip: "\n✦ Astuce : {tip}"
+    memory_scope_failed: "Le point de contrôle mémoire n'a pas pu être retiré ; la session est restée inchangée. Réessayez dans un instant."
   restart:
     in_progress: "⏳ Redémarrage du gateway déjà en cours..."
     restarting: "♻ Redémarrage du gateway. Si vous n'êtes pas notifié dans les 60 secondes, redémarrez depuis la console avec `hermes gateway restart`."
@@ -582,6 +583,8 @@ gateway:
     nothing: "Rien à annuler."
     removed: "↩️ {turns} tour(s) annulé(s) ({count} message(s)).\nSauvegardé dans : « {preview} »\nCopiez/modifiez le texte ci-dessus et envoyez-le pour relancer à partir d'ici."
     invalid_count: "Nombre invalide « {arg} » — utilisez /undo ou /undo N."
+    memory_scope_failed: "Le point de contrôle mémoire n'a pas pu être retiré ; la session est restée inchangée. Réessayez dans un instant."
+    frame_reset_without_rewind: "Le point de contrôle mémoire a été réinitialisé, mais aucun tour de conversation n'a pu être supprimé — la transcription est inchangée."
   update:
     platform_not_messaging: "✗ /update n'est disponible que depuis les plateformes de messagerie. Exécutez `hermes update` depuis le terminal."
     not_git_repo: "✗ Pas un dépôt git — impossible de mettre à jour."

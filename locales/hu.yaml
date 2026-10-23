@@ -332,6 +332,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — a munkamenet cím nélkül indult."
     title_empty_untitled: "\n⚠️ Tisztítás után a cím üres — a munkamenet cím nélkül indult."
     tip: "\n✦ Tipp: {tip}"
+    memory_scope_failed: "A memória-ellenőrzőpontot nem sikerült lezárni; a munkamenet változatlan maradt. Próbáld újra egy pillanat múlva."
   restart:
     in_progress: "⏳ Az átjáró újraindítása már folyamatban van..."
     restarting: "♻ Átjáró újraindítása. Ha 60 másodpercen belül nem kapsz értesítést, indítsd újra a konzolból a `hermes gateway restart` paranccsal."
@@ -511,6 +512,8 @@ gateway:
     nothing: "Nincs mit visszavonni."
     removed: "↩️ {turns} fordulat visszavonva ({count} üzenet).\nBiztonsági mentés ide: \"{preview}\"\nMásold/szerkeszd a fenti szöveget, és küldd el, hogy innen újra kérdezz."
     invalid_count: "Érvénytelen szám \"{arg}\" — használd a /undo vagy /undo N parancsot."
+    memory_scope_failed: "A memória-ellenőrzőpontot nem sikerült lezárni; a munkamenet változatlan maradt. Próbáld újra egy pillanat múlva."
+    frame_reset_without_rewind: "A memória-ellenőrzőpont visszaállt, de egyetlen beszélgetési kört sem sikerült eltávolítani — az átirat változatlan."
   update:
     platform_not_messaging: "✗ A /update csak üzenetküldő platformokról érhető el. Futtasd a `hermes update` parancsot a terminálból."
     not_git_repo: "✗ Nem git-tárhely — frissítés nem lehetséges."

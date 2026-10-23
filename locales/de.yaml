@@ -329,6 +329,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — Sitzung ohne Titel gestartet."
     title_empty_untitled: "\n⚠️ Titel ist nach Bereinigung leer — Sitzung ohne Titel gestartet."
     tip: "\n✦ Tipp: {tip}"
+    memory_scope_failed: "Der Speicher-Checkpoint konnte nicht abgeschlossen werden; die Sitzung blieb unverändert. Versuchen Sie es gleich noch einmal."
   restart:
     in_progress: "⏳ Gateway-Neustart läuft bereits..."
     restarting: "♻ Gateway wird neu gestartet. Falls Sie nicht innerhalb von 60 Sekunden benachrichtigt werden, starten Sie über die Konsole mit `hermes gateway restart` neu."
@@ -508,6 +509,8 @@ gateway:
     nothing: "Nichts zum Rückgängigmachen."
     removed: "↩️ {turns} Zug/Züge rückgängig gemacht ({count} Nachricht(en)).\nGesichert nach: \"{preview}\"\nKopieren/bearbeiten Sie den obigen Text und senden Sie ihn, um von hier aus erneut zu fragen."
     invalid_count: "Ungültige Anzahl \"{arg}\" — verwenden Sie /undo oder /undo N."
+    memory_scope_failed: "Der Speicher-Checkpoint konnte nicht abgeschlossen werden; die Sitzung blieb unverändert. Versuchen Sie es gleich noch einmal."
+    frame_reset_without_rewind: "Der Speicher-Checkpoint wurde zurückgesetzt, aber es konnte kein Gesprächsschritt entfernt werden — das Transkript ist unverändert."
   update:
     platform_not_messaging: "✗ /update ist nur auf Messaging-Plattformen verfügbar. Führen Sie `hermes update` im Terminal aus."
     not_git_repo: "✗ Kein Git-Repository — Update nicht möglich."

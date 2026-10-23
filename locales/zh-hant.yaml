@@ -329,6 +329,7 @@ gateway:
     title_error_untitled: "\n⚠️ {error} — 工作階段以未命名方式啟動。"
     title_empty_untitled: "\n⚠️ 清理後標題為空 — 工作階段以未命名方式啟動。"
     tip: "\n✦ 提示：{tip}"
+    memory_scope_failed: "無法結束記憶檢查點；工作階段未變更。請稍後再試。"
   restart:
     in_progress: "⏳ 閘道重新啟動已在進行中……"
     restarting: "♻ 正在重新啟動閘道。如果 60 秒內未收到通知，請在主控台執行 `hermes gateway restart` 重新啟動。"
@@ -508,6 +509,8 @@ gateway:
     nothing: "沒有可復原的內容。"
     removed: "↩️ 已復原 {turns} 個回合（{count} 則訊息）。\n已備份至：「{preview}」\n複製/編輯上方的文字並傳送，即可從此處重新提問。"
     invalid_count: "無效的數量「{arg}」—— 請使用 /undo 或 /undo N。"
+    memory_scope_failed: "無法結束記憶檢查點；工作階段未變更。請稍後再試。"
+    frame_reset_without_rewind: "記憶檢查點已重設，但無法移除任何對話回合 —— 逐字稿未變更。"
   update:
     platform_not_messaging: "✗ /update 僅在訊息平台上可用。請在終端機執行 `hermes update`。"
     not_git_repo: "✗ 不是 git 儲存庫 — 無法更新。"

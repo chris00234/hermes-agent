@@ -127,6 +127,7 @@ def _gateway_runner():
     entry = SessionEntry(session_key=key, session_id="sess-1", created_at=datetime.now(),
                          updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="dm", origin=source)
     runner.session_store = MagicMock()
+    runner.session_store.get_working_frame_scope.return_value = None
     runner.session_store.get_or_create_session.return_value = entry
     runner.session_store.reset_session.return_value = entry
     runner.session_store._entries = {key: entry}

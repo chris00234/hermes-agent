@@ -5,6 +5,8 @@ Covers default values, resolve_threshold() priority chain
 and the PINNED_THRESHOLDS escape-hatch for read_file.
 """
 
+import pytest
+
 from unittest.mock import patch
 
 
@@ -45,6 +47,27 @@ from tools.budget_config import (
 # ---------------------------------------------------------------------------
 
 
+
+class TestProfileCap:
+    def test_profile_cap_preserves_full_output_and_read_access(self, tmp_path, monkeypatch):
+        from tools.tool_result_storage import extract_persisted_path, maybe_persist_tool_result
+        from pathlib import Path
+
+        (tmp_path / "config.yaml").write_text("tool_budget:\n  result_size_chars: 24000\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(200_000)
+        content = "start\n" + "evidence\n" * 4000 + "END_SENTINEL"
+        preview = maybe_persist_tool_result(content, "session_search", "budget-test", config=cfg)
+        path = extract_persisted_path(preview)
+        assert path and Path(path).read_text() == content
+        assert len(preview) < 2500
+        assert cfg.resolve_threshold("read_file") == float("inf")
+
+    @pytest.mark.parametrize("value", ["bad", 0, -1])
+    def test_invalid_general_cap_keeps_default(self, tmp_path, monkeypatch, value):
+        (tmp_path / "config.yaml").write_text(f"tool_budget:\n  result_size_chars: {value}\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert budget_for_context_window(None).default_result_size == DEFAULT_RESULT_SIZE_CHARS
 
 
 # ---------------------------------------------------------------------------

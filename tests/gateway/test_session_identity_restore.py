@@ -152,3 +152,35 @@ def test_standalone_gateway_persists_nothing_and_keys_stay_agent_main(tmp_path, 
     assert identity_of(restored) is None
     assert fresh.runner._delivery_adapter_for(restored) is fresh.primary
     assert fresh.runner._session_key_for_source(restored) == "agent:main:telegram:dm:4040"
+
+
+def test_lane_routed_without_its_receiving_bot_adopts_the_next_live_message_s(mux):
+    """A lane first routed from a source with no pinned identity (a Telegram DM topic's opener,
+    admitted from its envelope before restore pinned one) has no ``transport_profile``. The next
+    message whose bot is KNOWN fills it — entry and sessions row, before that turn runs — and a known
+    bot is never replaced; an identity that only inferred its bot names nothing."""
+    store = SessionStore(sessions_dir=mux.home / "sessions", config=mux.runner.config)
+    mux.runner.session_store = store
+    unpinned = mux.team_b.build_source(chat_id="555", chat_type="dm", user_id="555", thread_id="97317")
+    unpinned.profile = "ops"  # what a restored envelope carries: the wire profile, no identity
+    entry = store.get_or_create_session(unpinned)
+    db = store._db_for_key(entry.session_key)
+    assert entry.session_key.startswith("agent:ops:") and entry.session_key.endswith(":97317")
+    assert entry.transport_profile is None and db.get_session(entry.session_id)["transport_profile"] is None
+
+    inferred = mux.team_b.build_source(chat_id="555", chat_type="dm", user_id="555", thread_id="97317")
+    inferred.profile = "ops"
+    inferred._transport_adapter_ref = None
+    assert resolve_identity(inferred, runner=mux.runner).transport_inferred
+    assert store.get_or_create_session(inferred) is entry and entry.transport_profile is None
+
+    live = mux.team_b.build_source(chat_id="555", chat_type="dm", user_id="555", thread_id="97317")
+    resolve_identity(live, runner=mux.runner, transport_profile="team_b")
+    assert store.get_or_create_session(live) is entry
+    assert entry.transport_profile == "team_b" and entry.to_dict()["transport_profile"] == "team_b"
+    assert db.get_session(entry.session_id)["transport_profile"] == "team_b"  # before the turn ends
+
+    other = mux.primary.build_source(chat_id="555", chat_type="dm", user_id="555", thread_id="97317")
+    other.profile = "ops"
+    resolve_identity(other, runner=mux.runner)
+    assert store.get_or_create_session(other) is entry and entry.transport_profile == "team_b"

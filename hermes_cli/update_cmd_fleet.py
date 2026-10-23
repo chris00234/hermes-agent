@@ -1505,6 +1505,11 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # Plus the gateways this update paused and already restarted on the new code.
     service_pids = _get_service_pids(all_profiles=True) | already_restarted()["pids"]
     manual_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+    if out.pre_restart_gateway_pids is not None:
+        # launchd may publish its replacement wrapper before the gateway child
+        # starts. A child appearing after the snapshot already runs updated code.
+        original_pids = set(out.pre_restart_gateway_pids)
+        manual_pids = [pid for pid in manual_pids if pid in original_pids]
     profile_processes = {
         proc.pid: proc
         for proc in find_profile_gateway_processes(exclude_pids=service_pids)

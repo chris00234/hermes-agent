@@ -34,7 +34,11 @@ A source checkout of the official repository tracks the **stable** channel: the
 latest published `vX.Y.Z` GitHub release (never a draft, prerelease or canary tag),
 checked out at its exact commit. `hermes update` and the Desktop update button move
 only from one release to the next, never commit by commit. Forks and mirrors keep
-tracking their `main` branch. The update prepares dependencies through PM and
+tracking their `main` branch, and so does a checkout on a branch other than `main`
+(a custom branch carrying local patches; see
+[Checkout parked on a feature branch](#checkout-parked-on-a-feature-branch)), because a
+release would land detached and leave that branch's commits out of the running
+code. The update prepares dependencies through PM and
 reports configuration changes and process-restart results.
 
 ```bash

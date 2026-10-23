@@ -73,15 +73,19 @@ def test_worker_overrides_target_the_migrated_server(launch, tmp_path):
         "HERMES_KANBAN_DB": str(tmp_path / "board" / "kanban.db"),
     })
     assert overrides, "dispatcher-owned worker must scope the managed MCP endpoint"
-    targeted = {arg.split(".env.", 1)[0].removeprefix("mcp_servers.") for arg in overrides}
+    targeted = {arg.removeprefix("mcp_servers.").split(".", 1)[0] for arg in overrides}
     migrated = _migrated_server_names(tmp_path)
     assert targeted <= migrated, f"overrides target {targeted - migrated}, which codex has no transport for"
     assert any(arg.startswith(f"mcp_servers.{next(iter(targeted))}.env.HERMES_KANBAN_TASK=") for arg in overrides)
 
 
-def test_only_dispatcher_owned_workers_get_mcp_overrides(launch):
-    """An ordinary launch and a worker that does not own the dispatcher's task emit no
-    ``mcp_servers.*`` override at all (nothing to scope, nothing for codex to reject)."""
-    assert launch({}) == []
+def test_only_dispatcher_owned_workers_get_kanban_overrides(launch):
+    """Ordinary launches retain profile identity without worker permissions or task scope."""
+    ordinary = launch({})
     with non_dispatcher_owned_context():
-        assert launch({"HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111"}) == []
+        inherited = launch({"HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111"})
+    for overrides in (ordinary, inherited):
+        config = tomllib.loads("\n".join(overrides))
+        server = config["mcp_servers"]["hermes-tools"]
+        assert set(server) == {"env"}
+        assert set(server["env"]) == {"HERMES_HOME"}

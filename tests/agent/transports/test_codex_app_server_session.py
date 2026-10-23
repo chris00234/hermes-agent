@@ -169,6 +169,52 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    @pytest.mark.parametrize("binding_format", ["legacy", "current"])
+    def test_recreated_agent_resumes_durable_thread_without_sharing_with_new_session(self, tmp_path, monkeypatch, binding_format):
+        from types import SimpleNamespace
+        from agent.codex_runtime import _ensure_codex_session
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="conversation", source="telegram", model="codex")
+        clients = []
+
+        def make_client(**kwargs):
+            client = FakeClient(**kwargs)
+            client._request_handler = lambda method, params: {
+                "thread": {"id": params.get("threadId", "native-conversation")}
+            }
+            clients.append(client)
+            return client
+
+        monkeypatch.setattr(session_mod, "CodexAppServerClient", make_client)
+        first = SimpleNamespace(_session_db=db, session_id="conversation", session_cwd=str(tmp_path))
+        _ensure_codex_session(first)
+        assert first._codex_session.ensure_started() == "native-conversation"
+        first._codex_session.close()
+        db.close()
+
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            restored = SimpleNamespace(_session_db=db, session_id="conversation", session_cwd=str(tmp_path))
+            _ensure_codex_session(restored)
+            assert restored._codex_session.ensure_started() == "native-conversation"
+            assert [method for method, params in clients[1].requests] == ["thread/resume"]
+            assert clients[1].requests[0][1]["threadId"] == "native-conversation"
+            copied_config = ({"codex_app_server_thread": {
+                "session_id": "conversation", "thread_id": "native-conversation",
+            }} if binding_format == "legacy" else {
+                "codex_thread_id": "native-conversation", "codex_thread_session_id": "conversation",
+            })
+            db.create_session(session_id="new-conversation", source="telegram", model="codex",
+                              model_config=copied_config)
+            new = SimpleNamespace(_session_db=db, session_id="new-conversation", session_cwd=str(tmp_path))
+            _ensure_codex_session(new)
+            new._codex_session.ensure_started()
+            assert clients[2].requests[0][0] == "thread/start"
+        finally:
+            db.close()
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -178,6 +224,20 @@ class TestLifecycle:
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
+
+    def test_native_turn_options_and_expired_budget_do_not_replay(self):
+        client = FakeClient()
+        session = make_session(client)
+        expired = session.run_turn("do not start", turn_timeout=0)
+        assert expired.interrupted
+        assert client.requests == []
+        client.queue_notification("turn/completed", threadId="t", turn={"id": "tu1", "status": "completed"})
+        completed = session.run_turn("hello", model="gpt-6-astra", reasoning_effort="high", turn_timeout=None)
+        assert not completed.error
+        starts = [params for method, params in client.requests if method == "turn/start"]
+        assert len(starts) == 1
+        assert starts[0]["model"] == "gpt-6-astra"
+        assert starts[0]["effort"] == "high"
 
     def test_thread_start_carries_hermes_prompt_and_disables_codex_personality(self):
         """thread/start carries cwd, Hermes' composed prompt as developerInstructions and
@@ -274,6 +334,28 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_quiet_native_reasoning_after_tool_does_not_cancel_default_turn(self, monkeypatch):
+        client = FakeClient()
+        client.queue_notification("item/completed", threadId="t", turnId="tu1", item={
+            "type": "commandExecution", "id": "exec", "command": "true", "status": "completed",
+            "aggregatedOutput": "", "exitCode": 0})
+        client.queue_notification("turn/completed", threadId="t", turn={"id": "tu1", "status": "completed"})
+        clock = [1000.0]
+        take_notification = client.take_notification
+
+        def delayed_notification(timeout=0):
+            if len(client._notifications) == 1 and clock[0] == 1000.0:
+                clock[0] += 91
+                return None
+            return take_notification(timeout)
+
+        monkeypatch.setattr(session_mod.time, "monotonic", lambda: clock[0])
+        client.take_notification = delayed_notification
+        result = make_session(client).run_turn("continue reasoning after the tool")
+        assert result.error is None
+        assert not result.interrupted
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -325,6 +407,16 @@ class TestRunTurn:
             make_session(client).run_turn("hi", model=model, turn_timeout=2.0)
             sent.append(next(p for (m, p) in client.requests if m == "turn/start").get("model"))
         assert sent == ["gpt-5.5", None]
+
+    @pytest.mark.parametrize("summary", ["auto", "none"])
+    def test_turn_start_carries_the_requested_reasoning_summary(self, summary):
+        """Without ``summary`` codex's reasoning items carry no text, so nothing is persisted or shown."""
+        client = FakeClient()
+        client.queue_notification("turn/completed", threadId="t",
+                                  turn={"id": "turn-fake-001", "status": "completed", "error": None})
+        make_session(client).run_turn("hi", reasoning_summary=summary, turn_timeout=2.0)
+        _, params = next(req for req in client.requests if req[0] == "turn/start")
+        assert params["summary"] == summary
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""

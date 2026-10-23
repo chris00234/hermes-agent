@@ -1554,7 +1554,14 @@ def _api_error_debug_info(error: Exception) -> dict[str, Any]:
 def dump_api_request_debug(
     agent, api_kwargs: dict[str, Any], *, reason: str, error: Optional[Exception] = None
 ) -> Optional[Path]:
-    """Dump the request body from api_kwargs (minus transport keys) for debugging provider 4xx failures."""
+    """Dump the request body from api_kwargs (minus transport keys) for debugging provider 4xx failures.
+    Private runs refuse dumps, including when the policy accessor fails."""
+    try:
+        _private = getattr(agent, "_private_execution_policy", None) is not None
+    except Exception:
+        _private = True
+    if _private:
+        return None
     try:
         body = {k: v for k, v in copy.deepcopy(api_kwargs).items() if v is not None and k != "timeout"}
         api_key = None
@@ -2518,6 +2525,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     )
     if not isinstance(function_args, dict):
         function_args = {}
+    # DE_DESIGN §5 graft: consult the private-policy accessor here too, so a
+    # caller passing the skip flags cannot bypass the funnel's tool gate.
+    try:
+        from agent.tool_executor import _private_execution_block_message
+
+        _private_block = _private_execution_block_message(agent, function_name)
+    except Exception:
+        _private_block = "Tool blocked: private execution policy state is unreadable"
+    if _private_block is not None:
+        return json.dumps({"error": _private_block}, ensure_ascii=False)
+
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:

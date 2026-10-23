@@ -215,6 +215,56 @@ class TestSpawnEnvIsolation:
     RUST_LOG on top of os.environ.copy().
     """
 
+    def test_spawn_env_preserves_HOME(self, monkeypatch, tmp_path):
+        """The spawn env must contain the parent process's HOME unchanged.
+        Verifies via a subprocess-monkey-patch."""
+        import subprocess
+        import tomllib
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = cmd
+                captured["env"] = kwargs.get("env", {}).copy()
+                # Provide minimal Popen surface so __init__ doesn't crash
+                # on attribute access during construction.
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HOME", "/users/alice")
+        profile_home = tmp_path / 'profile "study"'
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True  # so close() is a no-op
+        overrides = [captured["cmd"][i + 1] for i, value in enumerate(captured["cmd"]) if value == "-c"]
+        parsed = tomllib.loads("\n".join(overrides))
+        assert parsed["mcp_servers"]["hermes-tools"]["env"]["HERMES_HOME"] == str(profile_home)
+
+        # The spawn env must have HOME=/users/alice unchanged
+        assert captured["env"].get("HOME") == "/users/alice", (
+            f"HOME got rewritten in codex spawn env: "
+            f"{captured['env'].get('HOME')!r}. Codex's shell tool's "
+            "subprocesses (gh, git, aws, npm) need the user's real HOME."
+        )
 
     def test_spawn_env_sets_CODEX_HOME_when_provided(self, monkeypatch):
         """CODEX_HOME isolation must still work — that's the whole point
@@ -311,6 +361,10 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+        approved = {p.split(".")[3] for p in cmd if p.endswith('.approval_mode="approve"')}
+        assert approved == set(cas._KANBAN_WORKER_APPROVED_TOOLS)
+        assert all(t.startswith("kanban_") for t in approved)
+        assert "kanban_create" not in approved
 
 
 class TestSpawnEnvSecretStripping:
@@ -387,4 +441,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

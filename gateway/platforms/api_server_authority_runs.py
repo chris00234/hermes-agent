@@ -50,6 +50,8 @@ async def continued_session(adapter, session_id, request_id=None):
 
 
 def run_admission(adapter, run_id):
+    if run_id in getattr(adapter, '_private_run_ids', ()):
+        return None
     authority = _authority(adapter)
     if authority is None:
         return None

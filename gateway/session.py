@@ -14,12 +14,14 @@ from typing import Dict, List, Optional, Any
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
-from gateway.session_identity import transport_profile_of
+from gateway.session_identity import identity_of, transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
+from gateway.session_working_frame import SessionWorkingFrameMixin, working_frame_scope_or_none
+from agent.memory_provider import sanitize_working_frame_reference
 # Inverse of _session_key_namespace, defined storage-side (hermes_state must not import gateway).
 from hermes_state_keys import profile_from_session_key_namespace
 
@@ -493,6 +495,8 @@ class SessionEntry:
     chat_type: str = "dm"
     # Small, JSON-serializable per-entry state (e.g. Slack thread watermarks).
     metadata: dict[str, Any] = field(default_factory=dict)
+    working_frame_scope: Optional[dict[str, Any]] = None
+    working_frame_pending_scope: Optional[dict[str, Any]] = None
     # Token tracking
     input_tokens: int = 0
     output_tokens: int = 0
@@ -579,6 +583,10 @@ class SessionEntry:
             # Same defence-in-depth: routing JSON must never preserve malformed pin state.
             if pin := sanitize_prompt_pin(self.prompt_pin):
                 result["prompt_pin"] = pin
+        for key in ("working_frame_scope", "working_frame_pending_scope"):
+            reference = sanitize_working_frame_reference(getattr(self, key))
+            if reference is not None:
+                result[key] = reference
         if self.transport_profile:
             result["transport_profile"] = self.transport_profile
         if self.origin:
@@ -621,6 +629,8 @@ class SessionEntry:
             updated_at=datetime.fromisoformat(data["updated_at"]), origin=origin,
             display_name=data.get("display_name"), platform=platform,
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
+            working_frame_scope=working_frame_scope_or_none(data, "working_frame_scope"),
+            working_frame_pending_scope=working_frame_scope_or_none(data, "working_frame_pending_scope"),
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
             model_override=sanitize_model_override(data.get("model_override")),
@@ -783,6 +793,7 @@ class AsyncSessionStore:
 
 
 class SessionStore(
+    SessionWorkingFrameMixin,
     SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
     SessionPromptPinMixin,
 ):
@@ -962,6 +973,7 @@ class SessionStore(
         # Phase 3 (no lock): recovery + create + save + DB ops.
         if decision.needs_recover and decision.prev_session_id is None:
             self._route_recover(decision, session_key, source, now)
+        self._adopt_transport_profile(decision, session_key, source)
         create_kwargs = None
         if decision.entry is None:
             create_kwargs = self._route_create(
@@ -979,6 +991,23 @@ class SessionStore(
             origin=source, display_name=decision.entry.display_name,
         )
         return decision.entry
+
+    def _adopt_transport_profile(self, decision: _RouteDecision, session_key: str, source: SessionSource) -> None:
+        """A lane routed before its receiving bot was known adopts the bot a message's identity names
+        (live or restored, never inferred): the routing entry and, now, the sessions row. COALESCE in
+        the row and the None check here mean a known bot is never replaced."""
+        identity = identity_of(source)
+        if decision.entry is None or identity is None or not identity.multiplexed or identity.transport_inferred:
+            return
+        with self._lock:
+            entry = decision.entry
+            if entry.transport_profile is not None:
+                return
+            entry.transport_profile = identity.transport_profile
+            decision.needs_save = True
+            peer_sid, peer_origin, peer_name = entry.session_id, entry.origin, entry.display_name
+        self._record_gateway_session_peer(
+            peer_sid, session_key, peer_origin, display_name=peer_name, transport_profile=identity.transport_profile)
 
     def _apply_route_checks(
         self, session_key: str, checks: Optional[_RouteChecks], force_new: bool,

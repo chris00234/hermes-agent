@@ -11,7 +11,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from tools.clarify_evidence import ClarifyEvidence, OriginalCallback, OriginalReply
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    evidence: Optional[ClarifyEvidence] = None
 
 
 _lock = threading.RLock()
@@ -47,11 +51,12 @@ CANCELLED = "\x00cancelled"
 
 
 def register(clarify_id: str, session_key: str, question: str, choices: Optional[list[str]],
-             multi_select: bool = False) -> _ClarifyEntry:
+             multi_select: bool = False, *, evidence: Optional[ClarifyEvidence] = None) -> _ClarifyEntry:
     """Register a pending clarify request; caller then blocks on ``wait_for_response``.
     Open-ended (no choices) entries start in text mode: the next message IS the response."""
     entry = _ClarifyEntry(clarify_id, session_key, question, list(choices) if choices else None,
-                          bool(multi_select) and bool(choices), awaiting_text=not bool(choices))
+                          bool(multi_select) and bool(choices), awaiting_text=not bool(choices),
+                          evidence=evidence)
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
@@ -90,6 +95,8 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
     with _lock:
+        if entry.evidence and not entry.event.is_set():
+            entry.evidence.close("timeout")
         _entries.pop(clarify_id, None)  # regardless of outcome
         entry.event.set()  # Timeout also retires shared projections of this waiter.
         ids = _session_index.get(entry.session_key) or []
@@ -100,13 +107,22 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     return entry.response
 
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
+def resolve_gateway_clarify(
+    clarify_id: str, response: str, *, selected_reply: Optional[OriginalReply] = None,
+    selected_callback: Optional[OriginalCallback] = None,
+) -> bool:
     """Unblock the waiter on ``clarify_id``; False if already resolved/expired/unknown."""
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None or entry.event.is_set():
             return False
         entry.response = str(response) if response is not None else ""
+        if entry.evidence:
+            selected = selected_reply
+            if selected_callback is not None:
+                selected = (selected_callback if selected_reply is None
+                            and selected_callback.matches(entry.response) else None)
+            entry.evidence.close("resolved" if entry.response else "cancelled", selected)
         entry.event.set()
         return True
 
@@ -230,7 +246,9 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return json.dumps(selected, ensure_ascii=False) if selected else None
 
 
-def attempt_text_response_for_session(session_key: str, response: str) -> str:
+def attempt_text_response_for_session(
+    session_key: str, response: str, *, selected_reply: Optional[OriginalReply] = None,
+) -> str:
     """Try to resolve the oldest pending clarify from typed text; returns a TEXT_* outcome."""
     entry = get_pending_for_session(session_key, include_choice_prompts=True)
     if entry is None:
@@ -238,7 +256,7 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
     coerced, reason = _coerce_text_response_detailed(entry, response)
     if coerced is None:
         return TEXT_REJECTED_SELECTION if reason == "invalid_selection" else TEXT_REJECTED_PROSE
-    if resolve_gateway_clarify(entry.clarify_id, coerced):
+    if resolve_gateway_clarify(entry.clarify_id, coerced, selected_reply=selected_reply):
         return TEXT_RESOLVED
     return TEXT_NO_PENDING  # lost a race with a button/callback resolution — no work left
 
@@ -263,7 +281,7 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in _session_index.get(session_key) or [])
 
 
-def clear_session(session_key: str) -> int:
+def clear_session(session_key: str, *, reason: str = "cancelled") -> int:
     """Drop every pending clarify for a session (``/new``, shutdown, cached-agent eviction) so
     blocked agent threads don't outlive it; returns how many were cancelled. First-writer-wins: an already-set entry was answered for
     real, so it is dropped but its response preserved. The loop stays inside the lock so a button
@@ -275,6 +293,8 @@ def clear_session(session_key: str) -> int:
             if entry is None or entry.event.is_set():
                 continue
             entry.response = CANCELLED
+            if entry.evidence:
+                entry.evidence.close(reason)
             entry.event.set()
             cancelled += 1
     return cancelled

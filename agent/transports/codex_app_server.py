@@ -48,6 +48,11 @@ class CodexAppServerTransportError(CodexAppServerError):
 
 
 _TRANSPORT_LOST_CODE = -32000
+# Board-scoped handoff tools (they act only on HERMES_KANBAN_TASK); orchestrator tools stay gated.
+_KANBAN_WORKER_APPROVED_TOOLS = (
+    "kanban_show", "kanban_list", "kanban_heartbeat", "kanban_comment", "kanban_complete",
+    "kanban_block", "kanban_request_review", "kanban_request_changes",
+)
 
 
 def _snapshot_descendants(pid: int) -> list[Any]:
@@ -109,6 +114,15 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         cmd = [codex_bin, "app-server", *(extra_args or [])]
+        from hermes_constants import get_hermes_home
+
+        # The shared Codex config may still pin the profile that last ran migration.
+        cmd += ["-c", f'mcp_servers.hermes-tools.env.HERMES_HOME={json.dumps(str(get_hermes_home()))}']
+        from agent.transports.codex_app_server_profile_mcp import profile_mcp_home_overrides
+
+        # Every other server the profile declares runs under its HERMES_HOME too, as Hermes'
+        # own MCP client launches it.
+        cmd += profile_mcp_home_overrides(spawn_env, str(get_hermes_home()))
         from agent.delegation_context import (
             DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
             delegated_child_subprocess_env, is_dispatcher_owned_worker_context,
@@ -135,6 +149,10 @@ class CodexAppServerClient:
                 "-c", f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                 "-c", "sandbox_workspace_write.network_access=false",
             ]
+            # Unattended workers run with approval_policy=never, which rejects every MCP call
+            # unless the tool is pre-approved; approve only the board handoff tools.
+            for tool in _KANBAN_WORKER_APPROVED_TOOLS:
+                cmd += ["-c", f'mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.tools.{tool}.approval_mode="approve"']
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
