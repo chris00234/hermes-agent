@@ -787,6 +787,13 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     )
 
 
+def retire_codex_thread(agent) -> None:
+    """Drop the session and the session row's thread binding, so the next codex turn starts a fresh thread
+    seeded with the transcript (``_ensure_codex_session``) instead of continuing one that missed turns."""
+    _close_codex_session(agent)
+    _store_codex_thread_id(agent, None)
+
+
 def _codex_failure_field(failure_kind: str | None) -> dict[str, str]:
     """``codex_failure``: the session's FAILURE_* verdict, which activate_codex_app_server_fallback reads."""
     return {"codex_failure": failure_kind} if failure_kind else {}

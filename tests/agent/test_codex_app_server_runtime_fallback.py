@@ -127,9 +127,9 @@ def _make_agent(fallback_url: str | None, **kwargs):
     )
 
 
-def _run(agent, text: str = "hello") -> dict:
+def _run(agent, text: str = "hello", history: list | None = None) -> dict:
     with patch.object(agent, "_spawn_background_review", return_value=None):
-        return agent.run_conversation(text)
+        return agent.run_conversation(text, conversation_history=history)
 
 
 # --- trigger classes: each must activate the fallback for this turn --------------------------
@@ -269,6 +269,21 @@ def _hermes_closed_session(client, agent):
     client.on_turn_start = lambda: agent._codex_session.close()
 
 
+# A refresh failure codex logged earlier is no evidence about an unrelated failure: only codex's own
+# error (its text or codexErrorInfo) can name a login outage.
+_STALE_REFRESH_LINE = "ERROR codex_core::auth: token refresh failed: invalid_grant"
+
+
+def _bad_request_with_stale_refresh_line(client, _agent):
+    client.set_stderr_tail([_STALE_REFRESH_LINE])
+    client.raise_on["turn/start"] = CodexAppServerError(code=-32602, message="Invalid params: unsupported effort")
+
+
+def _untagged_context_window_with_stale_refresh_line(client, _agent):
+    client.set_stderr_tail([_STALE_REFRESH_LINE])
+    client.turn_failed("Codex ran out of room in the model's context window.")
+
+
 MUST_NOT = {
     "context-window": _context_window_exceeded,
     "policy-refusal": _policy_refusal,
@@ -277,6 +292,8 @@ MUST_NOT = {
     "tool-failure-inside-turn": _tool_failure_inside_turn,
     "user-stop": _user_stop,
     "hermes-closed-session": _hermes_closed_session,
+    "bad-request-with-stale-refresh-line": _bad_request_with_stale_refresh_line,
+    "untagged-context-window-with-stale-refresh-line": _untagged_context_window_with_stale_refresh_line,
 }
 
 
@@ -321,6 +338,52 @@ def test_outage_without_fallback_providers_returns_codex_error(case, clients):
     assert result["completed"] is False
     assert result["error"]
     assert agent.api_mode == "codex_app_server"
+
+
+# Codex's own words for each case; before this change none of them retired the session or replaced the error.
+_NO_FALLBACK_KEEPS = {
+    "auth-unauthorized-info": "Your session has ended",
+    "auth-login-expired": "Provided authentication token is expired",
+    "auth-not-logged-in": "Not logged in",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_NO_FALLBACK_KEEPS))
+def test_outage_without_fallback_providers_keeps_error_text_and_session(case, clients):
+    """Without fallback_providers the outage classification changes nothing: codex's own error is shown and
+    the app-server is kept for the next turn, exactly as before."""
+    agent = _make_agent(None)
+    TRIGGERS[case][0](clients.next(), agent)
+
+    result = _run(agent)
+
+    assert _NO_FALLBACK_KEEPS[case] in result["error"]
+    assert agent._codex_session is not None, "the session is not retired"
+
+
+@pytest.mark.parametrize("case", ["transport-5xx-retries-exhausted", "auth-unauthorized-info", "timeout-turn-start"])
+def test_next_codex_turn_sees_the_fallback_answer(case, clients, fallback_server):
+    """The fallback answered outside the codex thread, so codex must not continue that thread blind: the
+    next codex turn starts a thread seeded with the transcript, and no stored binding resumes the old one."""
+    from agent.codex_session_state import load_thread_id
+
+    fallback_url, _calls = fallback_server
+    agent = _make_agent(fallback_url)
+    first_client = clients.next()
+    TRIGGERS[case][0](first_client, agent)
+    first_client.turn_succeeded()  # served only if the old app-server were reused
+    clients.next().turn_succeeded()
+
+    first = _run(agent, "first")
+    assert first["final_response"] == FALLBACK_ANSWER
+    assert load_thread_id(agent) is None, "a new agent must not resume the thread that missed this turn"
+    second = _run(agent, "second", history=first["messages"])
+
+    assert second["final_response"] == CODEX_ANSWER
+    thread_starts = [params for client in clients.spawned for method, params in client.requests
+                     if method == "thread/start"]
+    assert len(thread_starts) == 2
+    assert FALLBACK_ANSWER in thread_starts[-1].get("developerInstructions", "")
 
 
 def test_fallback_is_turn_scoped_and_primary_returns_next_turn(clients, fallback_server):

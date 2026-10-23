@@ -173,8 +173,11 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
 # Generic auth words are authoritative only in the primary error. codex writes
 # independent ChatGPT plugin prewarm failures ("HTTP 401 Unauthorized") to stderr,
 # so there they must not mask an unrelated RPC error or timeout (#75167).
-_PRIMARY_ONLY_OAUTH_HINTS = (
-    "401 unauthorized", "unauthorized", "oauth", "auth profile", "not logged in", "sign in again", "token is expired",
+_PRIMARY_ONLY_OAUTH_HINTS = ("401 unauthorized", "unauthorized", "oauth", "auth profile")
+# Login-outage words (TurnResult.failure_kind only, never the hint or retirement above), trusted only in the
+# failed operation's own error: a refresh failure codex logged earlier says nothing about an unrelated failure.
+_AUTH_OUTAGE_HINTS = _OAUTH_REFRESH_FAILURE_HINTS + _PRIMARY_ONLY_OAUTH_HINTS + (
+    "not logged in", "sign in again", "token is expired",
 )
 
 _OAUTH_REAUTH_HINT = (
@@ -190,6 +193,11 @@ def _classify_oauth_failure(primary: str = "", *, stderr: str = "") -> Optional[
     if any(n in primary_l for n in _OAUTH_REFRESH_FAILURE_HINTS + _PRIMARY_ONLY_OAUTH_HINTS):
         return _OAUTH_REAUTH_HINT
     return _OAUTH_REAUTH_HINT if any(n in stderr_l for n in _OAUTH_REFRESH_FAILURE_HINTS) else None
+
+
+def _names_auth_outage(primary: str) -> bool:
+    primary_l = (primary or "").lower()
+    return any(n in primary_l for n in _AUTH_OUTAGE_HINTS)
 
 
 # ``codexErrorInfo`` (app-server v2 TurnError) variants that name the Codex backend failing once codex's own
@@ -421,20 +429,20 @@ class CodexAppServerSession:
         rejection, a session Hermes closed itself, a programming error)."""
         if self._closed:
             return None
-        primary = exc.message if isinstance(exc, CodexAppServerError) else ""
-        if _classify_oauth_failure(primary, stderr=self._stderr_blob(60)) is not None:
-            return FAILURE_AUTH
         if isinstance(exc, CodexAppServerTransportError):
             return FAILURE_DISCONNECT
-        return FAILURE_TIMEOUT if isinstance(exc, TimeoutError) else None
+        if isinstance(exc, TimeoutError):
+            return FAILURE_TIMEOUT
+        return FAILURE_AUTH if isinstance(exc, CodexAppServerError) and _names_auth_outage(exc.message) else None
 
     def _set_classified_error(self, result: TurnResult, prefix: str, classify_text: str, detail: Any) -> None:
         """OAuth failures -> re-auth hint AND retire (token store broken though JSON-RPC is fine); else stderr tail."""
         hint = _classify_oauth_failure(classify_text, stderr=self._stderr_blob(40))
         if hint is not None:
-            self._retire(result, hint, FAILURE_AUTH)
+            self._retire(result, hint)
         else:
             result.error = self._format_error_with_stderr(prefix, detail)
+        result.failure_kind = FAILURE_AUTH if _names_auth_outage(classify_text) else None
 
     def _start_for(self, result: TurnResult) -> bool:
         """ensure_started(); startup failures become a retiring TurnResult.error instead of raw exceptions."""
@@ -623,7 +631,6 @@ class CodexAppServerSession:
                 info = turn_obj["error"].get("codexErrorInfo") if isinstance(turn_obj["error"], dict) else None
                 if info not in (None, "other"):
                     result.failure_kind = _error_info_failure_kind(info)
-                    result.should_retire = result.should_retire or result.failure_kind == FAILURE_AUTH
             return True
 
         self._drive_turn(

@@ -1618,6 +1618,9 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
         return codex_result
+    # The fallback answers outside the codex thread: retire it so the next codex turn is seeded with this turn.
+    from agent.codex_runtime import retire_codex_thread
+    retire_codex_thread(agent)
     # Fallback activation rewrote provider/model/api_mode: retry this same user turn on the generic
     # loop below, keeping codex's projected rows and its failed API call in the turn's accounting.
     s.api_call_count = int(codex_result.get("api_calls") or 0)
